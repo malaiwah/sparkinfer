@@ -18,7 +18,7 @@ RUNTIME_CUDA_SOURCES = {
     "pcie_twoshot.cu",
 }
 RUNTIME_CUDA_HEADERS = {
-    "resident_grid.h",
+    "two_slot_selector.h",
 }
 
 
