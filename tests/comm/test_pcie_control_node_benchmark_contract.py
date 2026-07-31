@@ -49,12 +49,24 @@ def test_distributed_critical_path_uses_aligned_iteration_maxima() -> None:
     )
     per_rank = [
         {
-            "eager": {"cold_us": 11.0, "samples_us": [10.0, 1.0, 10.0, 1.0]},
-            "graph": {"cold_us": 7.0, "samples_us": [6.0, 2.0, 6.0, 2.0]},
+            "eager": {
+                "first_sample_us": 11.0,
+                "samples_us": [10.0, 1.0, 10.0, 1.0],
+            },
+            "graph": {
+                "first_sample_us": 7.0,
+                "samples_us": [6.0, 2.0, 6.0, 2.0],
+            },
         },
         {
-            "eager": {"cold_us": 12.0, "samples_us": [1.0, 10.0, 1.0, 10.0]},
-            "graph": {"cold_us": 8.0, "samples_us": [2.0, 6.0, 2.0, 6.0]},
+            "eager": {
+                "first_sample_us": 12.0,
+                "samples_us": [1.0, 10.0, 1.0, 10.0],
+            },
+            "graph": {
+                "first_sample_us": 8.0,
+                "samples_us": [2.0, 6.0, 2.0, 6.0],
+            },
         },
     ]
 
@@ -65,10 +77,10 @@ def test_distributed_critical_path_uses_aligned_iteration_maxima() -> None:
     assert max(sum(row["eager"]["samples_us"]) / 4 for row in per_rank) == 5.5
     assert result["eager"]["samples_us"] == [10.0, 10.0, 10.0, 10.0]
     assert result["eager"]["mean_us"] == 10.0
-    assert result["eager"]["cold_us"] == 12.0
+    assert result["eager"]["first_sample_us"] == 12.0
     assert result["graph"]["samples_us"] == [6.0, 6.0, 6.0, 6.0]
     assert result["graph"]["mean_us"] == 6.0
-    assert result["graph"]["cold_us"] == 8.0
+    assert result["graph"]["first_sample_us"] == 8.0
 
 
 def test_controller_paired_deltas_use_distributed_critical_path() -> None:
@@ -80,7 +92,7 @@ def test_controller_paired_deltas_use_distributed_critical_path() -> None:
     def record(variant: str, eager: float, graph: float) -> dict[str, object]:
         def mode(value: float) -> dict[str, float | list[float]]:
             return {
-                "cold_us": value,
+                "first_sample_us": value,
                 "mean_us": value,
                 "p50_us": value,
                 "p95_us": value,

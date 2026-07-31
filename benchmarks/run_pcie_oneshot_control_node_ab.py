@@ -95,7 +95,14 @@ HARDWARE_KEYS = {
     "nvidia_smi_samples",
     "nvidia_smi_topology",
 }
-METRIC_KEYS = {"cold_us", "mean_us", "p50_us", "p95_us", "min_us", "max_us"}
+METRIC_KEYS = {
+    "first_sample_us",
+    "mean_us",
+    "p50_us",
+    "p95_us",
+    "min_us",
+    "max_us",
+}
 RANK_MODE_KEYS = METRIC_KEYS | {"samples_us"}
 CRITICAL_MODE_KEYS = METRIC_KEYS | {"samples_us"}
 GRAPH_STRUCTURE_KEYS = {
@@ -285,7 +292,9 @@ def _distributed_critical_path(
             for index in range(next(iter(lengths)))
         ]
         result[mode] = {
-            "cold_us": max(float(row[mode]["cold_us"]) for row in per_rank),
+            "first_sample_us": max(
+                float(row[mode]["first_sample_us"]) for row in per_rank
+            ),
             **_summary(critical),
             "samples_us": critical,
         }
@@ -321,7 +330,15 @@ def _validate_run(
         or int(scope["size_bytes"]) != int(contract["numel"]) * 2
         or "net algorithm" not in str(scope["comparison_semantics"]).lower()
         or scope["excluded_paths"]
-        != ["fused_add_rms_norm", "twoshot_reduce_scatter", "twoshot_all_gather"]
+        != [
+            "oneshot_registered_all_reduce",
+            "oneshot_push_all_reduce",
+            "fused_add_rms_norm",
+            "twoshot_reduce_scatter",
+            "twoshot_all_gather",
+            "dcp_lse_reduce_scatter",
+            "dcp_head_all_gather",
+        ]
     ):
         raise ValueError(f"run scope is too broad or malformed: {scope}")
     identity = record["identity"]

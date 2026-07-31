@@ -89,7 +89,14 @@ PROVENANCE_KEYS = {
     "fresh_extension_cache",
     "post_run_verified",
 }
-METRIC_KEYS = {"cold_us", "mean_us", "p50_us", "p95_us", "min_us", "max_us"}
+METRIC_KEYS = {
+    "first_sample_us",
+    "mean_us",
+    "p50_us",
+    "p95_us",
+    "min_us",
+    "max_us",
+}
 RANK_MODE_KEYS = METRIC_KEYS | {"samples_us"}
 CRITICAL_MODE_KEYS = METRIC_KEYS | {"samples_us"}
 SOFTWARE_KEYS = {
@@ -544,13 +551,13 @@ def _measure(
     warmup: int,
     iters: int,
 ) -> tuple[float, list[float]]:
-    cold_start = torch.cuda.Event(enable_timing=True)
-    cold_end = torch.cuda.Event(enable_timing=True)
-    cold_start.record(stream)
+    first_start = torch.cuda.Event(enable_timing=True)
+    first_end = torch.cuda.Event(enable_timing=True)
+    first_start.record(stream)
     operation()
-    cold_end.record(stream)
+    first_end.record(stream)
     stream.synchronize()
-    cold_us = float(cold_start.elapsed_time(cold_end) * 1000)
+    first_sample_us = float(first_start.elapsed_time(first_end) * 1000)
 
     for _ in range(warmup):
         operation()
@@ -567,7 +574,7 @@ def _measure(
         float(start.elapsed_time(end) * 1000)
         for start, end in zip(starts, ends, strict=True)
     ]
-    return cold_us, samples
+    return first_sample_us, samples
 
 
 def _mutating_replay_preflight(
@@ -618,9 +625,9 @@ def _summary(samples: list[float]) -> dict[str, float]:
 
 
 def _gather_rank_metrics(
-    eager_cold_us: float,
+    eager_first_sample_us: float,
     eager_samples: list[float],
-    graph_cold_us: float,
+    graph_first_sample_us: float,
     graph_samples: list[float],
     graph_structure: dict[str, object],
     device: torch.device,
@@ -641,9 +648,9 @@ def _gather_rank_metrics(
         raise AssertionError("graph structure encoding must contain 14 values")
     local = torch.tensor(
         [
-            eager_cold_us,
+            eager_first_sample_us,
             *eager_samples,
-            graph_cold_us,
+            graph_first_sample_us,
             *graph_samples,
             *structure_values,
         ],
@@ -668,12 +675,12 @@ def _gather_rank_metrics(
             {
                 "rank": rank,
                 "eager": {
-                    "cold_us": values[0],
+                    "first_sample_us": values[0],
                     **eager_summary,
                     "samples_us": rank_eager_samples,
                 },
                 "graph": {
-                    "cold_us": values[graph_cold_index],
+                    "first_sample_us": values[graph_cold_index],
                     **graph_summary,
                     "samples_us": rank_graph_samples,
                 },
@@ -712,7 +719,9 @@ def _distributed_critical_path(
             for index in range(next(iter(lengths)))
         ]
         result[mode] = {
-            "cold_us": max(float(row[mode]["cold_us"]) for row in per_rank),
+            "first_sample_us": max(
+                float(row[mode]["first_sample_us"]) for row in per_rank
+            ),
             **_summary(critical_samples),
             "samples_us": critical_samples,
         }
@@ -761,7 +770,15 @@ def _validate_record(
         or int(scope["size_bytes"]) != int(contract["numel"]) * torch.bfloat16.itemsize
         or "net algorithm" not in str(scope["comparison_semantics"]).lower()
         or scope["excluded_paths"]
-        != ["fused_add_rms_norm", "twoshot_reduce_scatter", "twoshot_all_gather"]
+        != [
+            "oneshot_registered_all_reduce",
+            "oneshot_push_all_reduce",
+            "fused_add_rms_norm",
+            "twoshot_reduce_scatter",
+            "twoshot_all_gather",
+            "dcp_lse_reduce_scatter",
+            "dcp_head_all_gather",
+        ]
     ):
         raise ValueError(
             f"benchmark scope is not the narrow staged-path contract: {scope}"
@@ -1023,7 +1040,7 @@ def main() -> None:
         dist.barrier()
         if sampler is not None:
             sampler.mark_phase("eager_timing")
-        eager_cold_us, eager_samples = _measure(
+        eager_first_sample_us, eager_samples = _measure(
             eager_operation,
             stream=stream,
             warmup=args.warmup,
@@ -1043,7 +1060,7 @@ def main() -> None:
         dist.barrier()
         if sampler is not None:
             sampler.mark_phase("graph_timing")
-        graph_cold_us, graph_samples = _measure(
+        graph_first_sample_us, graph_samples = _measure(
             graph_operation,
             stream=stream,
             warmup=args.warmup,
@@ -1057,9 +1074,9 @@ def main() -> None:
         )
 
         per_rank = _gather_rank_metrics(
-            eager_cold_us,
+            eager_first_sample_us,
             eager_samples,
-            graph_cold_us,
+            graph_first_sample_us,
             graph_samples,
             graph_structure,
             device,
@@ -1098,9 +1115,13 @@ def main() -> None:
                         "candidate; not isolated launch overhead"
                     ),
                     "excluded_paths": [
+                        "oneshot_registered_all_reduce",
+                        "oneshot_push_all_reduce",
                         "fused_add_rms_norm",
                         "twoshot_reduce_scatter",
                         "twoshot_all_gather",
+                        "dcp_lse_reduce_scatter",
+                        "dcp_head_all_gather",
                     ],
                 },
                 "identity": {
