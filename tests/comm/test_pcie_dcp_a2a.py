@@ -328,6 +328,46 @@ def test_pool_isolates_reused_capture_stream_keys(monkeypatch):
     assert draft_channel._ext.dispose_calls == [1234]
 
 
+def test_pool_routes_nested_captures_to_innermost_channel(monkeypatch):
+    current_stream = [7]
+    capturing = [False]
+    pool = PCIeDCPA2APool(
+        rank=0,
+        world_size=2,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+        total_heads=32,
+        head_dim=64,
+        channel_factory=lambda stream_key: _make_runtime(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._current_stream_key",
+        lambda device, stream=None: (
+            current_stream[0] if stream is None else int(stream)
+        ),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.comm.pcie.pcie_dcp_a2a._is_current_stream_capturing",
+        lambda device: capturing[0],
+    )
+
+    with pool.capture(7) as outer_channel:
+        current_stream[0] = 8
+        with pool.capture() as inner_channel:
+            capturing[0] = True
+            current_stream[0] = 80
+            assert pool.for_stream() is inner_channel
+            capturing[0] = False
+
+        capturing[0] = True
+        current_stream[0] = 70
+        assert pool.for_stream() is outer_channel
+        capturing[0] = False
+
+    assert outer_channel is not inner_channel
+    assert pool._capture_channel_stack == []
+
+
 def test_pool_rolls_back_throwaway_capture_channels(monkeypatch):
     created = []
 
