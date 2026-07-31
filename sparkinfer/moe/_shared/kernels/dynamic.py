@@ -822,7 +822,11 @@ class MoEDynamicKernelBackend:
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
             num_topk=self.num_topk,
-            activation=self.activation,
+            # This helper is gated-only and is never launched unless the split
+            # materialized path is active.  Use a valid inert specialization for
+            # non-split activations (notably ReLU2) instead of rejecting them
+            # during otherwise valid monolithic-kernel construction.
+            activation=self.activation if self.w4a8_split_materialized else "silu",
         )
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
@@ -4196,15 +4200,7 @@ class MoEDynamicKernelBackend:
             # region; A bufs in sA past the FC2-intermediate bytes; FC1
             # residual bufs in sC (dead until the epilogue rendezvous); FC2
             # residual bufs alias the (FC1-only) A-buf region.
-            if cutlass.const_expr(self.w4a8_repacked):
-                w4a8_sa0 = (
-                    ctrl_base_addr
-                    + Int32(Storage._offsets["sA"])
-                    + Int32(self.tile_shape_mnk[0] * self.tile_shape_mnk[2])
-                )
-                w4a8_res0 = ctrl_base_addr + Int32(Storage._offsets["sC"])
-                w4a8_res2 = w4a8_sa0
-            elif cutlass.const_expr(self.w4a8_small):
+            if cutlass.const_expr(self.w4a8_repacked or self.w4a8_small):
                 w4a8_sa0 = (
                     ctrl_base_addr
                     + Int32(Storage._offsets["sA"])
