@@ -249,9 +249,10 @@ def test_trellis_w4a16_capture_prewarm_uses_exact_runtime_key(
     assert len(fused_calls) == 2
     assert {call["size_m"] for call in fused_calls} == {3072}
     assert {call["max_m_blocks"] for call in fused_calls} == {542}
-    assert workspace.planned_fused_moe_launches[
-        ("trellis3_t256", "e4m3_k32", 3072, False)
-    ] is resolved_fused
+    assert (
+        workspace.planned_fused_moe_launches[("trellis3_t256", "e4m3_k32", 3072, False)]
+        is resolved_fused
+    )
 
 
 def _positive_fp8(shape: tuple[int, ...]) -> torch.Tensor:
@@ -272,7 +273,7 @@ def _pattern_e8m0(shape: tuple[int, ...], *, offset: int = 0) -> torch.Tensor:
     numel = 1
     for dim in shape:
         numel *= int(dim)
-    storage = ((torch.arange(numel, device="cuda", dtype=torch.int64) + offset) % 4 + 119)
+    storage = (torch.arange(numel, device="cuda", dtype=torch.int64) + offset) % 4 + 119
     return storage.to(torch.uint8).reshape(shape).view(e8m0_dtype)
 
 
@@ -299,9 +300,7 @@ def _quantize_dense_moe_weight_storage(
             torch.float8_e4m3fn
         )
         scale = scale.to(torch.float32)
-        output_scale = 1.0 / (scale * (1.0 / global_scale[group_idx])).clamp(
-            min=1e-30
-        )
+        output_scale = 1.0 / (scale * (1.0 / global_scale[group_idx])).clamp(min=1e-30)
         clipped = torch.clamp(
             sliced * output_scale,
             -FLOAT4_E2M1_MAX,
@@ -321,7 +320,9 @@ def _make_weights(
     hidden_size: int,
     intermediate_size: int,
     activation: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     is_gated = activation in {"silu", "situ"}
     w13_rows = intermediate_size * (2 if is_gated else 1)
     w13 = torch.randint(
@@ -344,8 +345,12 @@ def _make_weights(
     w2_blockscale = swizzle_block_scale(
         _positive_fp8((experts, hidden_size, intermediate_size // 16))
     )
-    w13_global_scale = (torch.rand(experts, device="cuda") * 0.1 + 0.05).to(torch.float32)
-    w2_global_scale = (torch.rand(experts, device="cuda") * 0.1 + 0.05).to(torch.float32)
+    w13_global_scale = (torch.rand(experts, device="cuda") * 0.1 + 0.05).to(
+        torch.float32
+    )
+    w2_global_scale = (torch.rand(experts, device="cuda") * 0.1 + 0.05).to(
+        torch.float32
+    )
     return w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale
 
 
@@ -655,12 +660,8 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
             share_expert_scales=True,
             single_token=True,
         )
-        e4m3 = MoEMicroKernelW4A16SmallMDirect(
-            scale_format="e4m3_k16", **common
-        )
-        e8m0 = MoEMicroKernelW4A16SmallMDirect(
-            scale_format="e8m0_k32", **common
-        )
+        e4m3 = MoEMicroKernelW4A16SmallMDirect(scale_format="e4m3_k16", **common)
+        e8m0 = MoEMicroKernelW4A16SmallMDirect(scale_format="e8m0_k32", **common)
         assert e4m3.__cache_key__ != e8m0.__cache_key__
     experts, hidden_size = 4, 128
     rows = intermediate_size * (2 if activation == "silu" else 1)
@@ -730,9 +731,7 @@ def test_w4a16_e8m0_native_micro_matches_raw_e8m0_oracle(
         2 * m * fc2_n_chunks * 128 * topk, dtype=torch.bfloat16, device="cuda"
     )
     x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
-    topk_ids = torch.randint(
-        0, experts, (m, topk), dtype=torch.int32, device="cuda"
-    )
+    topk_ids = torch.randint(0, experts, (m, topk), dtype=torch.int32, device="cuda")
     topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
 
     def launch() -> torch.Tensor:
@@ -1026,20 +1025,15 @@ def test_w4a16_beats_nvfp4_against_true_fp32_oracle_for_odd_shapes(
     for batch_size, seq_len, topk, ids_dtype, input_scale in cases:
         m = batch_size * seq_len
         torch.manual_seed(
-            20260525
-            + m * 31
-            + topk
-            + (1000 if activation == "silu" else 0)
+            20260525 + m * 31 + topk + (1000 if activation == "silu" else 0)
         )
         rows = intermediate_size * (2 if activation == "silu" else 1)
-        w13_dense = (
-            torch.randn(experts, rows, hidden_size, device="cuda")
-            * (0.18 if activation == "silu" else 0.08)
+        w13_dense = torch.randn(experts, rows, hidden_size, device="cuda") * (
+            0.18 if activation == "silu" else 0.08
         )
-        w2_dense = (
-            torch.randn(experts, hidden_size, intermediate_size, device="cuda")
-            * (0.18 if activation == "silu" else 0.08)
-        )
+        w2_dense = torch.randn(
+            experts, hidden_size, intermediate_size, device="cuda"
+        ) * (0.18 if activation == "silu" else 0.08)
         w13_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
         w2_global_scale = torch.ones(experts, dtype=torch.float32, device="cuda")
         w13, w13_blockscale = _quantize_dense_moe_weight_storage(
@@ -1169,10 +1163,7 @@ def test_w4a16_modelopt_direct_replay_ignores_stale_swizzle_tail(
     topk = 2
     monkeypatch.setenv("SPARKINFER_W4A16_SMALL_M_DIRECT", "1")
     torch.manual_seed(
-        20260730
-        + (1000 if activation == "silu" else 0)
-        + m
-        + intermediate_size
+        20260730 + (1000 if activation == "silu" else 0) + m + intermediate_size
     )
     real_direct_launch = w4a16_kernel._w4a16_small_m_direct_launch_flat
     direct_launches: list[tuple[int, int]] = []
@@ -1349,10 +1340,7 @@ def test_w4a16_modelopt_direct_non64_intermediate_is_bounds_safe(
         spy_direct_launch,
     )
     torch.manual_seed(
-        20260731
-        + m
-        + intermediate_size
-        + (1000 if activation == "silu" else 0)
+        20260731 + m + intermediate_size + (1000 if activation == "silu" else 0)
     )
 
     rows = intermediate_size * (2 if activation == "silu" else 1)
@@ -2051,7 +2039,11 @@ def test_w4a16_modelopt_nvfp4_explicit_w13_layout_matches_oracle(
             [w13_blockscale[:, half:], w13_blockscale[:, :half]], dim=1
         ).contiguous()
 
-    prepare = prepare_w4a16_modelopt_native_weights if prepare_native else prepare_w4a16_weights
+    prepare = (
+        prepare_w4a16_modelopt_native_weights
+        if prepare_native
+        else prepare_w4a16_weights
+    )
     kwargs = {"source_format": "modelopt_nvfp4"} if prepare_native else {}
     prepared = prepare(
         source_w13,
@@ -2116,9 +2108,7 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
         activation=activation,
     )
     w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
-    w13_input_scale = (torch.rand(experts, device="cuda") * 2.0 + 1.5).to(
-        torch.float32
-    )
+    w13_input_scale = (torch.rand(experts, device="cuda") * 2.0 + 1.5).to(torch.float32)
     w2_input_scale = (torch.rand(experts, device="cuda") * 2.0 + 1.5).to(torch.float32)
     a1_gscale = (1.0 / w13_input_scale).contiguous()
     a2_gscale = (1.0 / w2_input_scale).contiguous()
@@ -2162,8 +2152,9 @@ def test_tp_moe_w4a16_modelopt_nvfp4_uses_normal_nvfp4_scale_contract(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stress(
-) -> None:
+def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stress() -> (
+    None
+):
     torch.manual_seed(20260526)
     experts, hidden_size, intermediate_size = 8, 128, 128
     activation = "silu"
@@ -2174,9 +2165,7 @@ def test_tp_moe_w4a16_prepared_reuse_path_is_deterministic_under_odd_shape_stres
         activation=activation,
     )
     reference_weights = tuple(t.clone() for t in weights)
-    w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = (
-        weights
-    )
+    w13, w13_blockscale, w13_global_scale, w2, w2_blockscale, w2_global_scale = weights
     a_gscale = torch.ones(experts, dtype=torch.float32, device="cuda")
     weight_plan = plan_sparkinfer_fp4_moe_weights(
         quant_modes="w4a16",
@@ -2288,7 +2277,9 @@ def test_w4a16_moe_matches_oracle_with_expert_map(
     expert_map = torch.full((global_experts,), -1, dtype=torch.int32, device="cuda")
     expert_map[::2] = torch.arange(local_experts, dtype=torch.int32, device="cuda")
 
-    valid_global_ids = torch.arange(0, global_experts, 2, dtype=torch.int32, device="cuda")
+    valid_global_ids = torch.arange(
+        0, global_experts, 2, dtype=torch.int32, device="cuda"
+    )
     x = (torch.randn(m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
     topk_ids = valid_global_ids[
         torch.randint(0, local_experts, (m, topk), device="cuda")
@@ -2330,9 +2321,7 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
         activation=activation,
     )
     w13, w13_blockscale, _, w2, w2_blockscale, w2_global_scale = weights
-    w13_global_scale = torch.full(
-        (experts,), 8.0, dtype=torch.float32, device="cuda"
-    )
+    w13_global_scale = torch.full((experts,), 8.0, dtype=torch.float32, device="cuda")
     weights = (
         w13,
         w13_blockscale,
@@ -2420,9 +2409,9 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
     experts, hidden_size, intermediate_size = 8, 128, 128
     topk, live_m, capacity_m = 2, 24, 32
     activation = "relu2"
-    assert select_route_block_size_m(live_m, topk, experts) != select_route_block_size_m(
-        capacity_m, topk, experts
-    )
+    assert select_route_block_size_m(
+        live_m, topk, experts
+    ) != select_route_block_size_m(capacity_m, topk, experts)
     weights = _make_weights(
         experts=experts,
         hidden_size=hidden_size,
@@ -2430,7 +2419,9 @@ def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
         activation=activation,
     )
     x = (torch.randn(live_m, hidden_size, device="cuda") * 0.25).to(torch.bfloat16)
-    topk_ids = torch.randint(0, experts, (live_m, topk), device="cuda", dtype=torch.int32)
+    topk_ids = torch.randint(
+        0, experts, (live_m, topk), device="cuda", dtype=torch.int32
+    )
     topk_weights = torch.softmax(torch.randn(live_m, topk, device="cuda"), dim=-1)
     prepared = prepare_w4a16_weights(
         *weights,
