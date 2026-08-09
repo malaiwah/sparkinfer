@@ -91,8 +91,7 @@ from b12x._lib.scratch import (
 
 logger = logging.getLogger(__name__)
 _B12X_TIMING = (
-    os.getenv("B12X_TIMING", "0") == "1"
-    or os.getenv("VLLM_B12X_TIMING", "0") == "1"
+    os.getenv("B12X_TIMING", "0") == "1" or os.getenv("VLLM_B12X_TIMING", "0") == "1"
 )
 _B12X_TIMING_THRESHOLD_MS = float(
     os.getenv(
@@ -2562,7 +2561,7 @@ def _plan_core_workspace(
         )
         requested_route_E = int(route_num_experts or weight_E)
         full_rotation = weight_layout == "trellis3_t256"
-        route_E = requested_route_E if full_rotation else int(weight_E)
+        route_E = max(requested_route_E, int(weight_E))
         if full_rotation:
             if source_format not in _TRELLIS_SOURCE_FORMATS:
                 raise ValueError(
@@ -2577,9 +2576,7 @@ def _plan_core_workspace(
                 raise ValueError("trellis_bits must be one of 2, 3, 4, 5, 6")
             trellis_tile_config = trellis_tile_config or (64, 256, 64, 256)
             if qsrt_storage_format not in {None, "qsrt_atoms_v1"}:
-                raise ValueError(
-                    "qsrt_storage_format must be None or 'qsrt_atoms_v1'"
-                )
+                raise ValueError("qsrt_storage_format must be None or 'qsrt_atoms_v1'")
             if qsrt_storage_format is not None and (
                 int(trellis_bits) != 3 or int(n) != 256
             ):
@@ -6566,6 +6563,9 @@ def _plan_full_rotation_w4a16_launches(
             f"got weight_layout={weight_layout!r}, scale_format={scale_format!r}"
         )
     w13_layout = "trellis3_t256_proj"
+    trellis_pair_kind = (
+        "PDYNAMIC" if core_plan.qsrt_storage_format == "qsrt_atoms_v1" else None
+    )
     _, capacity_route_slots, capacity_m_blocks = route_pack_capacity(
         capacity_tokens * core_plan.num_topk,
         block_size_m,
@@ -6620,6 +6620,8 @@ def _plan_full_rotation_w4a16_launches(
                 scale_format=scale_format,
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
+                fc1_trellis_pair_kind=trellis_pair_kind,
+                fc2_trellis_pair_kind=trellis_pair_kind,
                 force_tile_config=core_plan.trellis_tile_config,
                 intermediate_rotation=True,
                 full_rotation=True,
@@ -10772,8 +10774,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 activation in ("relu2", "silu")
                 and m == 1
                 and a1_gscale.numel() == 1
-                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1")
-                != "0"
+                and os.environ.get("B12X_MICRO_SHARE_INPUT_ACROSS_EXPERTS", "1") != "0"
             ),
             share_expert_scales=(
                 activation in ("relu2", "silu")
@@ -11131,9 +11132,7 @@ def _select_experts_reference(
     )
 
 
-def b12x_route_experts_fast(
-    *, binding: TPMoERouteBinding
-) -> B12XTopKRouting:
+def b12x_route_experts_fast(*, binding: TPMoERouteBinding) -> B12XTopKRouting:
     """Public sparse-routing entrypoint for higher-level integrations.
 
     This is the optimization seam for future fast routing work. The current

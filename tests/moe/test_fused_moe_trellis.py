@@ -105,6 +105,7 @@ def test_trellis_w4a8_rejects_mixed_suh_modes_and_token_scratch_for_routes() -> 
         shared_suh=True,
         gate_suh=torch.ones((1, hidden), dtype=torch.float16),
         up_suh=torch.ones((experts, hidden), dtype=torch.float16),
+        down_svh=torch.ones((1, hidden), dtype=torch.float16),
     )
     with pytest.raises(ValueError, match="disagree with shared_suh"):
         run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
@@ -117,8 +118,10 @@ def test_trellis_w4a8_rejects_mixed_suh_modes_and_token_scratch_for_routes() -> 
         run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
 
 
+@pytest.mark.parametrize("down_rows", [1, 4])
 def test_trellis_w4a8_multipart_prepares_shared_input_once(
     monkeypatch: pytest.MonkeyPatch,
+    down_rows: int,
 ) -> None:
     import b12x.moe._shared.kernels.trellis_w4a8 as w4a8
 
@@ -130,6 +133,7 @@ def test_trellis_w4a8_multipart_prepares_shared_input_once(
     weights = torch.ones((m, topk), dtype=torch.float32)
     gate_suh = torch.ones((1, hidden), dtype=torch.float16)
     up_suh = torch.ones((1, hidden), dtype=torch.float16)
+    down_svh = torch.ones((down_rows, hidden), dtype=torch.float16)
     parts = tuple(
         SimpleNamespace(
             marker=marker,
@@ -141,7 +145,7 @@ def test_trellis_w4a8_multipart_prepares_shared_input_once(
             shared_suh=True,
             gate_suh=gate_suh,
             up_suh=up_suh,
-            down_svh=torch.ones((1, hidden), dtype=torch.float16),
+            down_svh=down_svh,
         )
         for marker in (1, 2)
     )
@@ -210,13 +214,75 @@ def test_trellis_w4a8_multipart_prepares_shared_input_once(
     torch.testing.assert_close(actual, torch.full_like(actual, 3.0))
 
 
-def test_trellis_w4a8_multipart_rejects_distinct_suh_identity() -> None:
+@pytest.mark.parametrize("fault", ["dtype", "device", "shape", "contiguity"])
+def test_trellis_w4a8_rejects_malformed_down_svh_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    import b12x.moe._shared.kernels.trellis_w4a8 as w4a8
+
+    hidden = 1024
+    experts = 4
+    if fault == "dtype":
+        down_svh = torch.ones((1, hidden), dtype=torch.bfloat16)
+    elif fault == "device":
+        down_svh = torch.empty((1, hidden), dtype=torch.float16, device="meta")
+    elif fault == "shape":
+        down_svh = torch.ones((experts - 1, hidden), dtype=torch.float16)
+    else:
+        down_svh = torch.ones((1, hidden * 2), dtype=torch.float16)[:, ::2]
+    prepared = SimpleNamespace(
+        hidden_size=hidden,
+        intermediate_size=256,
+        num_experts=experts,
+        trellis_codebook="sqg_xor_cheb_t12",
+        activation="silu",
+        shared_suh=True,
+        gate_suh=torch.ones((1, hidden), dtype=torch.float16),
+        up_suh=torch.ones((1, hidden), dtype=torch.float16),
+        down_svh=down_svh,
+    )
+    scratch = make_trellis_w4a8_moe_scratch(
+        m=1,
+        topk=1,
+        hidden_size=hidden,
+        intermediate_size=256,
+        device="cpu",
+    )
+    launches = 0
+
+    def record_launch(*_args, **_kwargs) -> None:
+        nonlocal launches
+        launches += 1
+
+    monkeypatch.setattr(
+        w4a8,
+        "run_trellis_w4a8_input_rotation_quant",
+        record_launch,
+    )
+    with pytest.raises(ValueError, match=r"prepared\.down_svh"):
+        run_trellis_w4a8_moe(
+            torch.zeros((1, hidden), dtype=torch.float16),
+            prepared,
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            scratch,
+        )
+    assert launches == 0
+
+
+def test_trellis_w4a8_multipart_rejects_distinct_scale_identity() -> None:
     hidden = 1024
     experts = 4
     gate_suh = torch.ones((1, hidden), dtype=torch.float16)
     up_suh = torch.ones((1, hidden), dtype=torch.float16)
+    down_svh = torch.ones((1, hidden), dtype=torch.float16)
 
-    def part(*, gate: torch.Tensor) -> SimpleNamespace:
+    def part(
+        *,
+        gate: torch.Tensor,
+        down: torch.Tensor = down_svh,
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             hidden_size=hidden,
             intermediate_size=256,
@@ -226,6 +292,7 @@ def test_trellis_w4a8_multipart_rejects_distinct_suh_identity() -> None:
             shared_suh=True,
             gate_suh=gate,
             up_suh=up_suh,
+            down_svh=down,
         )
 
     source = torch.zeros((1, hidden), dtype=torch.float16)
@@ -240,6 +307,18 @@ def test_trellis_w4a8_multipart_rejects_distinct_suh_identity() -> None:
         run_trellis_w4a8_moe_parts(
             source,
             (part(gate=gate_suh), part(gate=gate_suh.clone())),
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            scratch,
+            output_accum=torch.empty((1, hidden), dtype=torch.float32),
+        )
+    with pytest.raises(ValueError, match="does not share down_svh identity"):
+        run_trellis_w4a8_moe_parts(
+            source,
+            (
+                part(gate=gate_suh),
+                part(gate=gate_suh, down=down_svh.clone()),
+            ),
             torch.ones((1, 1), dtype=torch.float32),
             torch.zeros((1, 1), dtype=torch.int32),
             scratch,

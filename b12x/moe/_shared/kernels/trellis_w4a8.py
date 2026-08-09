@@ -260,15 +260,16 @@ def _validate_prepared_part(
             f"'situ', got {activation!r}"
         )
     num_experts = int(prepared.num_experts)
-    for name in ("gate_suh", "up_suh"):
-        suh = getattr(prepared, name, None)
+    for name in ("gate_suh", "up_suh", "down_svh"):
+        scale = getattr(prepared, name, None)
         if (
-            not isinstance(suh, torch.Tensor)
-            or suh.ndim != 2
-            or int(suh.shape[1]) != hidden_size
-            or suh.dtype != torch.float16
-            or suh.device != device
-            or not suh.is_contiguous()
+            not isinstance(scale, torch.Tensor)
+            or scale.ndim != 2
+            or int(scale.shape[0]) not in (1, num_experts)
+            or int(scale.shape[1]) != hidden_size
+            or scale.dtype != torch.float16
+            or scale.device != device
+            or not scale.is_contiguous()
         ):
             raise ValueError(
                 f"prepared.{name} must be contiguous fp16 [1|E,{hidden_size}] "
@@ -329,7 +330,7 @@ def _validate_prepared_parts(
             )
         if part_shared_suh is not shared_suh:
             raise ValueError("W4A8 prepared parts disagree on shared_suh")
-        for name in ("gate_suh", "up_suh"):
+        for name in ("gate_suh", "up_suh", "down_svh"):
             if not _same_tensor_view(getattr(first, name), getattr(prepared, name)):
                 raise ValueError(
                     f"W4A8 prepared part {index} does not share {name} identity"
