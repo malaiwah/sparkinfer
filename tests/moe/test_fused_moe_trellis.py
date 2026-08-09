@@ -19,6 +19,7 @@ from b12x.gemm._shared.wo_mxfp8 import (
 from b12x.moe._shared.kernels.trellis_w4a8 import (
     make_trellis_w4a8_moe_scratch,
     run_trellis_w4a8_moe,
+    run_trellis_w4a8_moe_parts,
     view_trellis_w4a8_moe_scratch,
 )
 from b12x.moe._shared.kernels.trellis_w4a8_transform import (
@@ -38,7 +39,6 @@ from b12x._lib.quant.sqg_e4m3 import (
 _MCG = np.uint64(0xCBAC1FED)
 _MCG_MASK = np.uint32(0x8FFF8FFF)
 _MCG_OR = np.uint32(0x3B603B60)
-
 
 
 @pytest.mark.parametrize("shared_suh", [True, False])
@@ -61,9 +61,7 @@ def test_trellis_w4a8_scratch_modes_have_allocation_free_prefix_views(
     assert scratch.gate_quantized.values.shape == (expected_capacity_rows, hidden)
     assert scratch.up_quantized.values.shape == (expected_capacity_rows, hidden)
 
-    view = view_trellis_w4a8_moe_scratch(
-        scratch, m=m, topk=topk, shared_suh=shared_suh
-    )
+    view = view_trellis_w4a8_moe_scratch(scratch, m=m, topk=topk, shared_suh=shared_suh)
     expected_rows = m if shared_suh else m * topk
     assert view.gate_quantized.values.shape == (expected_rows, hidden)
     assert view.up_quantized.values.shape == (expected_rows, hidden)
@@ -119,9 +117,153 @@ def test_trellis_w4a8_rejects_mixed_suh_modes_and_token_scratch_for_routes() -> 
         run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
 
 
+def test_trellis_w4a8_multipart_prepares_shared_input_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import b12x.moe._shared.kernels.trellis_w4a8 as w4a8
+
+    m = topk = 2
+    hidden = 1024
+    experts = 4
+    source = torch.zeros((m, hidden), dtype=torch.float16)
+    ids = torch.zeros((m, topk), dtype=torch.int32)
+    weights = torch.ones((m, topk), dtype=torch.float32)
+    gate_suh = torch.ones((1, hidden), dtype=torch.float16)
+    up_suh = torch.ones((1, hidden), dtype=torch.float16)
+    parts = tuple(
+        SimpleNamespace(
+            marker=marker,
+            hidden_size=hidden,
+            intermediate_size=256,
+            num_experts=experts,
+            trellis_codebook="sqg_xor_cheb_t12",
+            activation="silu",
+            shared_suh=True,
+            gate_suh=gate_suh,
+            up_suh=up_suh,
+            down_svh=torch.ones((1, hidden), dtype=torch.float16),
+        )
+        for marker in (1, 2)
+    )
+    scratch = make_trellis_w4a8_moe_scratch(
+        m=m,
+        topk=topk,
+        hidden_size=hidden,
+        intermediate_size=256,
+        device="cpu",
+    )
+    output_accum = torch.empty((m, hidden), dtype=torch.float32)
+    counts = {
+        "input": 0,
+        "fc1": 0,
+        "activation": 0,
+        "fc2": 0,
+        "sum": 0,
+    }
+    marker = [0]
+
+    def count_input(*args, **kwargs) -> None:
+        counts["input"] += 1
+
+    def count_fc1(*args, **kwargs) -> None:
+        counts["fc1"] += 1
+
+    def count_activation(*args, **kwargs) -> None:
+        counts["activation"] += 1
+
+    def count_fc2(_activation, prepared, *args, **kwargs) -> None:
+        counts["fc2"] += 1
+        marker[0] = prepared.marker
+
+    def count_sum(_fc2, output, *args, **kwargs) -> None:
+        counts["sum"] += 1
+        output.fill_(marker[0])
+
+    monkeypatch.setattr(w4a8, "run_trellis_w4a8_input_rotation_quant", count_input)
+    monkeypatch.setattr(w4a8, "run_trellis_w4a8_fc1_routes", count_fc1)
+    monkeypatch.setattr(
+        w4a8,
+        "run_trellis_w4a8_activation_rotation_quant",
+        count_activation,
+    )
+    monkeypatch.setattr(w4a8, "run_trellis_w4a8_fc2_routes", count_fc2)
+    monkeypatch.setattr(w4a8, "_w4a16_topk_sum_launch_flat", count_sum)
+    monkeypatch.setattr(w4a8.torch.cuda, "current_stream", lambda: 0)
+    monkeypatch.setattr(w4a8, "cuda_stream_to_int", int)
+
+    actual = run_trellis_w4a8_moe_parts(
+        source,
+        parts,
+        weights,
+        ids,
+        scratch,
+        output_accum=output_accum,
+    )
+
+    assert counts == {
+        "input": 1,
+        "fc1": 2,
+        "activation": 2,
+        "fc2": 2,
+        "sum": 2,
+    }
+    torch.testing.assert_close(actual, torch.full_like(actual, 3.0))
+
+
+def test_trellis_w4a8_multipart_rejects_distinct_suh_identity() -> None:
+    hidden = 1024
+    experts = 4
+    gate_suh = torch.ones((1, hidden), dtype=torch.float16)
+    up_suh = torch.ones((1, hidden), dtype=torch.float16)
+
+    def part(*, gate: torch.Tensor) -> SimpleNamespace:
+        return SimpleNamespace(
+            hidden_size=hidden,
+            intermediate_size=256,
+            num_experts=experts,
+            trellis_codebook="sqg_xor_cheb_t12",
+            activation="silu",
+            shared_suh=True,
+            gate_suh=gate,
+            up_suh=up_suh,
+        )
+
+    source = torch.zeros((1, hidden), dtype=torch.float16)
+    scratch = make_trellis_w4a8_moe_scratch(
+        m=1,
+        topk=1,
+        hidden_size=hidden,
+        intermediate_size=256,
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="does not share gate_suh identity"):
+        run_trellis_w4a8_moe_parts(
+            source,
+            (part(gate=gate_suh), part(gate=gate_suh.clone())),
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            scratch,
+            output_accum=torch.empty((1, hidden), dtype=torch.float32),
+        )
+
+    first = part(gate=gate_suh)
+    incompatible = part(gate=gate_suh)
+    incompatible.num_experts = experts + 1
+    with pytest.raises(ValueError, match="incompatible expert geometry"):
+        run_trellis_w4a8_moe_parts(
+            source,
+            (first, incompatible),
+            torch.ones((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.int32),
+            scratch,
+            output_accum=torch.empty((1, hidden), dtype=torch.float32),
+        )
+
+
 def test_trellis_w4a8_activation_dispatch_fails_closed() -> None:
     with pytest.raises(ValueError, match="must be 'silu' or 'situ'"):
         TrellisW4A8ActivationRotationKernel(activation="relu")
+
 
 def _weight_plan(
     *,
@@ -181,14 +323,17 @@ def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
 
 
 def test_exl3_trellis_plan_accepts_k3_and_rejects_k2() -> None:
-    assert _weight_plan(
-        num_experts=1,
-        hidden_size=128,
-        intermediate_size=128,
-        input_dtype=torch.bfloat16,
-        trellis_bits=3,
-        tile_config=(64, 128, 64, 128),
-    ).trellis_bits == 3
+    assert (
+        _weight_plan(
+            num_experts=1,
+            hidden_size=128,
+            intermediate_size=128,
+            input_dtype=torch.bfloat16,
+            trellis_bits=3,
+            tile_config=(64, 128, 64, 128),
+        ).trellis_bits
+        == 3
+    )
     with pytest.raises(ValueError, match=r"\(3, 4, 5, 6\)"):
         _weight_plan(
             num_experts=1,
@@ -387,20 +532,26 @@ def test_planned_route_block_overrides_live_batch_heuristic() -> None:
     # m=1024/topk=8/E=256 selects 48 heuristically. A caller-owned arena
     # planned for 64 must retain 64 so route packing cannot outgrow its
     # block-expert table.
-    assert _resolve_route_block_size_m(
-        m=1024,
-        topk=8,
-        route_num_experts=256,
-        planned_block_size_m=None,
-        fused_launch=None,
-    ) == 48
-    assert _resolve_route_block_size_m(
-        m=1024,
-        topk=8,
-        route_num_experts=256,
-        planned_block_size_m=64,
-        fused_launch=None,
-    ) == 64
+    assert (
+        _resolve_route_block_size_m(
+            m=1024,
+            topk=8,
+            route_num_experts=256,
+            planned_block_size_m=None,
+            fused_launch=None,
+        )
+        == 48
+    )
+    assert (
+        _resolve_route_block_size_m(
+            m=1024,
+            topk=8,
+            route_num_experts=256,
+            planned_block_size_m=64,
+            fused_launch=None,
+        )
+        == 64
+    )
     with pytest.raises(RuntimeError, match="planned_block_size_m=64"):
         _resolve_route_block_size_m(
             m=1024,
@@ -637,12 +788,10 @@ def _reference_full_rotation(
     )
 
 
-
 def _mxfp8_roundtrip(value: torch.Tensor) -> torch.Tensor:
     quantized = quantize_mxfp8_rows_torch(value)
-    return dequantize_mxfp8_rows_torch(
-        quantized.values, quantized.scale_rows
-    )
+    return dequantize_mxfp8_rows_torch(quantized.values, quantized.scale_rows)
+
 
 def _reference_full_rotation_decoded(
     x: torch.Tensor,
@@ -781,19 +930,27 @@ def _qsrt_atom_extent_from_pair_payloads(
             selected = payload.index_select(0, ids)
             low_words = hidden_tiles * 8 * 16 * low_bits
             if fc1:
-                low = selected[:, :low_words].reshape(
-                    -1, hidden_tiles, 8, 16 * low_bits
-                ).permute(2, 0, 1, 3)
-                high = selected[:, low_words:].reshape(
-                    -1, hidden_tiles, 8, 16 * high_bits
-                ).permute(2, 0, 1, 3)
+                low = (
+                    selected[:, :low_words]
+                    .reshape(-1, hidden_tiles, 8, 16 * low_bits)
+                    .permute(2, 0, 1, 3)
+                )
+                high = (
+                    selected[:, low_words:]
+                    .reshape(-1, hidden_tiles, 8, 16 * high_bits)
+                    .permute(2, 0, 1, 3)
+                )
             else:
-                low = selected[:, :low_words].reshape(
-                    -1, 8, hidden_tiles, 16 * low_bits
-                ).permute(1, 0, 2, 3)
-                high = selected[:, low_words:].reshape(
-                    -1, 8, hidden_tiles, 16 * high_bits
-                ).permute(1, 0, 2, 3)
+                low = (
+                    selected[:, :low_words]
+                    .reshape(-1, 8, hidden_tiles, 16 * low_bits)
+                    .permute(1, 0, 2, 3)
+                )
+                high = (
+                    selected[:, low_words:]
+                    .reshape(-1, 8, hidden_tiles, 16 * high_bits)
+                    .permute(1, 0, 2, 3)
+                )
             joined = torch.cat(
                 (low.reshape(8, ids.numel(), -1), high.reshape(8, ids.numel(), -1)),
                 dim=2,
@@ -802,18 +959,14 @@ def _qsrt_atom_extent_from_pair_payloads(
             selected_atoms[..., : joined.shape[-1]].copy_(joined)
             matrix_atoms.index_copy_(1, ids, selected_atoms)
         atoms[:, :, offset : offset + matrix_atom_bytes].copy_(
-            matrix_atoms.contiguous().view(torch.uint8).reshape(
-                8, experts, matrix_atom_bytes
-            )
+            matrix_atoms.contiguous()
+            .view(torch.uint8)
+            .reshape(8, experts, matrix_atom_bytes)
         )
 
     store_matrix(w13_payload[0], fc1_modes, offset=0, fc1=True)
-    store_matrix(
-        w13_payload[1], fc1_modes, offset=matrix_atom_bytes, fc1=True
-    )
-    store_matrix(
-        w2_payload, fc2_modes, offset=2 * matrix_atom_bytes, fc1=False
-    )
+    store_matrix(w13_payload[1], fc1_modes, offset=matrix_atom_bytes, fc1=True)
+    store_matrix(w2_payload, fc2_modes, offset=2 * matrix_atom_bytes, fc1=False)
     for matrix, offset in enumerate(
         (
             atom_trellis_bytes,
@@ -822,13 +975,17 @@ def _qsrt_atom_extent_from_pair_payloads(
         )
     ):
         values = intermediate_rotations[:, matrix * 256 : (matrix + 1) * 256]
-        scale_atoms = torch.cat(
-            (
-                values[:, :128].reshape(experts, 8, 16),
-                values[:, 128:].reshape(experts, 8, 16),
-            ),
-            dim=2,
-        ).permute(1, 0, 2).contiguous()
+        scale_atoms = (
+            torch.cat(
+                (
+                    values[:, :128].reshape(experts, 8, 16),
+                    values[:, 128:].reshape(experts, 8, 16),
+                ),
+                dim=2,
+            )
+            .permute(1, 0, 2)
+            .contiguous()
+        )
         atoms[:, :, offset : offset + 64].copy_(
             scale_atoms.view(torch.uint8).reshape(8, experts, 64)
         )
@@ -853,19 +1010,13 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
     if pair_case == "PDYNAMIC":
         fc1_kinds = ["P24", "P33"]
         fc2_kinds = ["P33", "P24"]
-        fc1_pair_spec = torch.tensor(
-            [1, 0], dtype=torch.int32, device=device
-        )
-        fc2_pair_spec = torch.tensor(
-            [0, 1], dtype=torch.int32, device=device
-        )
+        fc1_pair_spec = torch.tensor([1, 0], dtype=torch.int32, device=device)
+        fc2_pair_spec = torch.tensor([0, 1], dtype=torch.int32, device=device)
     else:
         fc1_kinds = [pair_case] * experts
         fc2_kinds = [pair_case] * experts
         mode = 1 if pair_case == "P24" else 0
-        fc1_pair_spec = torch.full(
-            (experts,), mode, dtype=torch.int32, device=device
-        )
+        fc1_pair_spec = torch.full((experts,), mode, dtype=torch.int32, device=device)
         fc2_pair_spec = fc1_pair_spec.clone()
 
     def make_pair(
@@ -1102,14 +1253,65 @@ def test_qsrt_atom_fused_moe_matches_full_rotation_reference_and_captures(
             mxfp8=True,
         )
         w4a8_relative_error = (
-            (w4a8_actual - w4a8_reference).norm()
-            / w4a8_reference.norm().clamp_min(1.0e-9)
-        )
+            w4a8_actual - w4a8_reference
+        ).norm() / w4a8_reference.norm().clamp_min(1.0e-9)
         w4a8_cosine = torch.nn.functional.cosine_similarity(
             w4a8_actual.flatten(), w4a8_reference.flatten(), dim=0
         )
         assert float(w4a8_relative_error) <= 4.0e-2
         assert float(w4a8_cosine) >= 0.998
+        if pair_case == "PDYNAMIC":
+            second_prepared = replace(
+                prepared,
+                fc1_trellis_pair_modes=prepared.fc2_trellis_pair_modes,
+                fc2_trellis_pair_modes=prepared.fc1_trellis_pair_modes,
+            )
+            second_output = run_trellis_w4a8_moe(
+                x,
+                second_prepared,
+                router_weights,
+                ids,
+                w4a8_scratch,
+            ).clone()
+            sequential_reference = w4a8_actual + second_output
+            multipart_accum = torch.empty_like(w4a8_scratch.output)
+            multipart_actual = run_trellis_w4a8_moe_parts(
+                x,
+                (prepared, second_prepared),
+                router_weights,
+                ids,
+                w4a8_scratch,
+                output_accum=multipart_accum,
+            )
+            torch.testing.assert_close(
+                multipart_actual,
+                sequential_reference,
+                rtol=0,
+                atol=0,
+            )
+
+            multipart_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(multipart_graph):
+                multipart_captured = run_trellis_w4a8_moe_parts(
+                    x,
+                    (prepared, second_prepared),
+                    router_weights,
+                    ids,
+                    w4a8_scratch,
+                    output_accum=multipart_accum,
+                )
+            torch.cuda.synchronize(device)
+            allocated_before_replay = torch.cuda.memory_allocated(device)
+            multipart_graph.replay()
+            torch.cuda.synchronize(device)
+            allocated_after_replay = torch.cuda.memory_allocated(device)
+            assert allocated_after_replay == allocated_before_replay
+            torch.testing.assert_close(
+                multipart_captured,
+                sequential_reference,
+                rtol=0,
+                atol=0,
+            )
 
     public_weight_plan = _weight_plan(
         num_experts=experts,
@@ -1540,9 +1742,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
         )
 
         def scales(shape: tuple[int, ...]) -> torch.Tensor:
-            return (0.875 + 0.25 * torch.rand(shape, device=device)).to(
-                torch.float16
-            )
+            return (0.875 + 0.25 * torch.rand(shape, device=device)).to(torch.float16)
 
         gate_suh = scales((experts, hidden)).contiguous()
         up_suh = scales((experts, hidden)).contiguous()
@@ -1570,9 +1770,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
         x = (torch.randn((max_tokens, hidden), device=device) * 1.0e-3).to(
             torch.bfloat16
         )
-        global_ids = torch.tensor(
-            [[0, 3], [2, 1]], dtype=torch.int32, device=device
-        )
+        global_ids = torch.tensor([[0, 3], [2, 1]], dtype=torch.int32, device=device)
         expert_map = (
             torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
             if experts == 2
@@ -1631,9 +1829,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
             # Unmapped, negative, and out-of-range global ids must be rejected
             # inside the fused kernel before weight access. The top-k sum must
             # skip those stale route rows as well.
-            sparse_map = torch.tensor(
-                [0, -1, 1, -1], dtype=torch.int32, device=device
-            )
+            sparse_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32, device=device)
             invalid_global_ids = torch.tensor(
                 [[0, 1], [route_experts + 3, -1]],
                 dtype=torch.int32,
@@ -1671,9 +1867,8 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
                 down_svh,
             )
             invalid_relative_error = (
-                (invalid_actual - invalid_reference).norm()
-                / invalid_reference.norm().clamp_min(1.0e-9)
-            )
+                invalid_actual - invalid_reference
+            ).norm() / invalid_reference.norm().clamp_min(1.0e-9)
             assert float(invalid_relative_error) <= 2.0e-2
             assert torch.count_nonzero(invalid_actual[1]) == 0
 
@@ -1695,10 +1890,7 @@ def test_full_rotation_reuses_compiled_kernels_across_expert_counts(
                 key: id(value.compiled)
                 for key, value in w4a16_kernel._FUSED_CACHE.items()
             },
-            {
-                key: id(value.compiled)
-                for key, value in w4a16_kernel._SUM_CACHE.items()
-            },
+            {key: id(value.compiled) for key, value in w4a16_kernel._SUM_CACHE.items()},
         )
         if compiled_after_first is None:
             compiled_after_first = compiled_now

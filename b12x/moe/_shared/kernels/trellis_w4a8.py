@@ -35,8 +35,6 @@ class TrellisW4A8MoeScratch:
     """Caller-owned intermediate storage for one fixed ``(M, top-k)`` shape."""
 
     route_experts: torch.Tensor
-    gate_rotated: torch.Tensor
-    up_rotated: torch.Tensor
     # Broadcast checkpoints quantize one FC1 operand per token.  Per-expert
     # checkpoints quantize one operand per route because each route applies a
     # different input rotation.
@@ -44,10 +42,25 @@ class TrellisW4A8MoeScratch:
     up_quantized: MXFP8Rows
     gate_fc1: torch.Tensor
     up_fc1: torch.Tensor
-    activated_rotated: torch.Tensor
     activated_quantized: MXFP8Rows
     fc2: torch.Tensor
     output: torch.Tensor
+
+
+@dataclass(frozen=True)
+class TrellisW4A8PreparedInput:
+    """Route map and H-dimensional MXFP8 operands shared by compatible parts."""
+
+    route_experts: torch.Tensor
+    gate_quantized: MXFP8Rows
+    up_quantized: MXFP8Rows
+    m: int
+    topk: int
+    hidden_size: int
+    num_experts: int
+    shared_suh: bool
+    gate_suh: torch.Tensor
+    up_suh: torch.Tensor
 
 
 def make_trellis_w4a8_moe_scratch(
@@ -78,20 +91,13 @@ def make_trellis_w4a8_moe_scratch(
     device = torch.device(device)
     routes = m * topk
     input_rows = m if shared_suh else routes
-    gate_rotated = torch.empty(
-        (routes, hidden_size), dtype=torch.float16, device=device
-    )
-    up_rotated = torch.empty_like(gate_rotated)
     gate_fc1 = torch.empty(
         (routes, intermediate_size), dtype=torch.float16, device=device
     )
     up_fc1 = torch.empty_like(gate_fc1)
-    activated_rotated = torch.empty_like(gate_fc1)
-    fc2 = torch.empty_like(gate_rotated)
+    fc2 = torch.empty((routes, hidden_size), dtype=torch.float16, device=device)
     return TrellisW4A8MoeScratch(
         route_experts=torch.empty((routes,), dtype=torch.int32, device=device),
-        gate_rotated=gate_rotated,
-        up_rotated=up_rotated,
         gate_quantized=empty_mxfp8_rows_for_dense_gemm(
             input_rows, hidden_size, device=device
         ),
@@ -100,7 +106,6 @@ def make_trellis_w4a8_moe_scratch(
         ),
         gate_fc1=gate_fc1,
         up_fc1=up_fc1,
-        activated_rotated=activated_rotated,
         activated_quantized=empty_mxfp8_rows_for_dense_gemm(
             routes, intermediate_size, device=device
         ),
@@ -148,8 +153,6 @@ def view_trellis_w4a8_moe_scratch(
 
     return TrellisW4A8MoeScratch(
         route_experts=prefix("route_experts", scratch.route_experts, routes),
-        gate_rotated=prefix("gate_rotated", scratch.gate_rotated, routes),
-        up_rotated=prefix("up_rotated", scratch.up_rotated, routes),
         gate_quantized=_mxfp8_rows_prefix(
             scratch.gate_quantized, input_rows, name="scratch.gate_quantized"
         ),
@@ -158,9 +161,6 @@ def view_trellis_w4a8_moe_scratch(
         ),
         gate_fc1=prefix("gate_fc1", scratch.gate_fc1, routes),
         up_fc1=prefix("up_fc1", scratch.up_fc1, routes),
-        activated_rotated=prefix(
-            "activated_rotated", scratch.activated_rotated, routes
-        ),
         activated_quantized=_mxfp8_rows_prefix(
             scratch.activated_quantized,
             routes,
@@ -235,54 +235,17 @@ def _check_mxfp8_rows(
         )
 
 
-def run_trellis_w4a8_moe(
-    source: torch.Tensor,
-    prepared,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    scratch: TrellisW4A8MoeScratch,
+def _validate_prepared_part(
+    prepared: object,
     *,
-    expert_map: torch.Tensor | None = None,
-    fast_math: bool = False,
-) -> torch.Tensor:
-    """Run a homogeneous compact E4M3 trellis tier through native W4A8 MMA.
-
-    ``topk_ids`` are local indices into ``prepared`` unless ``expert_map`` is
-    supplied.  In that case it is an int32 global-to-local table; ``-1`` map
-    entries are inactive routes and contribute exactly zero.
-    """
-
-    if source.ndim != 2 or source.dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError("source must be contiguous BF16/FP16 [M,H]")
-    if not source.is_contiguous():
-        raise ValueError("source must be contiguous")
-    if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
-        raise TypeError("topk_ids must be contiguous int32/int64 [M,top-k]")
-    if not topk_ids.is_contiguous():
-        raise ValueError("topk_ids must be contiguous")
-    if (
-        topk_weights.shape != topk_ids.shape
-        or topk_weights.dtype != torch.float32
-    ):
-        raise TypeError("topk_weights must be contiguous FP32 with topk_ids shape")
-    if not topk_weights.is_contiguous():
-        raise ValueError("topk_weights must be contiguous")
-    if topk_ids.device != source.device or topk_weights.device != source.device:
-        raise ValueError("source and routing tensors must share one CUDA device")
-
-    m, hidden_size = map(int, source.shape)
-    topk = int(topk_ids.shape[1])
-    if int(topk_ids.shape[0]) != m:
-        raise ValueError(
-            f"topk_ids must have one row per source token, got {topk_ids.shape[0]} and {m}"
-        )
-    routes = m * topk
-    intermediate_size = int(prepared.intermediate_size)
+    hidden_size: int,
+    device: torch.device,
+) -> tuple[int, bool]:
     if int(prepared.hidden_size) != hidden_size:
         raise ValueError(
             f"source hidden size {hidden_size} != prepared {prepared.hidden_size}"
         )
-    if intermediate_size != 256:
+    if int(prepared.intermediate_size) != 256:
         raise ValueError("the initial TP12 W4A8 path requires local intermediate 256")
     trellis_codebook = str(getattr(prepared, "trellis_codebook", "")).lower()
     if trellis_codebook != "sqg_xor_cheb_t12":
@@ -304,12 +267,12 @@ def run_trellis_w4a8_moe(
             or suh.ndim != 2
             or int(suh.shape[1]) != hidden_size
             or suh.dtype != torch.float16
-            or suh.device != source.device
+            or suh.device != device
             or not suh.is_contiguous()
         ):
             raise ValueError(
                 f"prepared.{name} must be contiguous fp16 [1|E,{hidden_size}] "
-                f"on {source.device}"
+                f"on {device}"
             )
     shared_suh = getattr(prepared, "shared_suh", None)
     if type(shared_suh) is not bool:
@@ -322,7 +285,91 @@ def run_trellis_w4a8_moe(
             "prepared gate_suh/up_suh rows disagree with shared_suh; "
             f"got {gate_suh_rows}, {up_suh_rows}, expected {expected_suh_rows}"
         )
+    return num_experts, shared_suh
+
+
+def _same_tensor_view(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return (
+        left.data_ptr() == right.data_ptr()
+        and left.storage_offset() == right.storage_offset()
+        and left.shape == right.shape
+        and left.stride() == right.stride()
+        and left.dtype == right.dtype
+        and left.device == right.device
+    )
+
+
+def _validate_prepared_parts(
+    source: torch.Tensor,
+    prepared_parts: tuple[object, ...],
+) -> tuple[int, bool]:
+    if not prepared_parts:
+        raise ValueError("prepared_parts must contain at least one W4A8 part")
+    if source.ndim != 2 or source.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("source must be contiguous BF16/FP16 [M,H]")
+    if not source.is_contiguous():
+        raise ValueError("source must be contiguous")
+    hidden_size = int(source.shape[1])
+    first = prepared_parts[0]
+    num_experts, shared_suh = _validate_prepared_part(
+        first,
+        hidden_size=hidden_size,
+        device=source.device,
+    )
+    for index, prepared in enumerate(prepared_parts[1:], start=1):
+        part_num_experts, part_shared_suh = _validate_prepared_part(
+            prepared,
+            hidden_size=hidden_size,
+            device=source.device,
+        )
+        if part_num_experts != num_experts:
+            raise ValueError(
+                "W4A8 prepared parts have incompatible expert geometry: "
+                f"part 0 has {num_experts}, part {index} has {part_num_experts}"
+            )
+        if part_shared_suh is not shared_suh:
+            raise ValueError("W4A8 prepared parts disagree on shared_suh")
+        for name in ("gate_suh", "up_suh"):
+            if not _same_tensor_view(getattr(first, name), getattr(prepared, name)):
+                raise ValueError(
+                    f"W4A8 prepared part {index} does not share {name} identity"
+                )
+    return num_experts, shared_suh
+
+
+def prepare_trellis_w4a8_moe_input(
+    source: torch.Tensor,
+    prepared: object,
+    topk_ids: torch.Tensor,
+    scratch: TrellisW4A8MoeScratch,
+    *,
+    expert_map: torch.Tensor | None = None,
+) -> TrellisW4A8PreparedInput:
+    """Materialize routes and quantize the shared H-dimensional operands once."""
+
+    num_experts, shared_suh = _validate_prepared_parts(source, (prepared,))
+    if topk_ids.ndim != 2 or topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must be contiguous int32/int64 [M,top-k]")
+    if not topk_ids.is_contiguous():
+        raise ValueError("topk_ids must be contiguous")
+    if topk_ids.device != source.device:
+        raise ValueError("source and routing tensors must share one CUDA device")
+    m, hidden_size = map(int, source.shape)
+    topk = int(topk_ids.shape[1])
+    if int(topk_ids.shape[0]) != m:
+        raise ValueError(
+            "topk_ids must have one row per source token, "
+            f"got {topk_ids.shape[0]} and {m}"
+        )
+    routes = m * topk
     input_rows = m if shared_suh else routes
+    _check_tensor(
+        "scratch.route_experts",
+        scratch.route_experts,
+        shape=(routes,),
+        dtype=torch.int32,
+        device=source.device,
+    )
     _check_mxfp8_rows(
         "scratch.gate_quantized",
         scratch.gate_quantized,
@@ -337,44 +384,6 @@ def run_trellis_w4a8_moe(
         k=hidden_size,
         device=source.device,
     )
-    _check_mxfp8_rows(
-        "scratch.activated_quantized",
-        scratch.activated_quantized,
-        m=routes,
-        k=intermediate_size,
-        device=source.device,
-    )
-
-    _check_tensor(
-        "scratch.route_experts",
-        scratch.route_experts,
-        shape=(routes,),
-        dtype=torch.int32,
-        device=source.device,
-    )
-    for name, tensor, shape in (
-        ("gate_rotated", scratch.gate_rotated, (routes, hidden_size)),
-        ("up_rotated", scratch.up_rotated, (routes, hidden_size)),
-        ("gate_fc1", scratch.gate_fc1, (routes, intermediate_size)),
-        ("up_fc1", scratch.up_fc1, (routes, intermediate_size)),
-        ("activated_rotated", scratch.activated_rotated, (routes, intermediate_size)),
-        ("fc2", scratch.fc2, (routes, hidden_size)),
-    ):
-        _check_tensor(
-            f"scratch.{name}",
-            tensor,
-            shape=shape,
-            dtype=torch.float16,
-            device=source.device,
-        )
-    _check_tensor(
-        "scratch.output",
-        scratch.output,
-        shape=(m, hidden_size),
-        dtype=torch.float32,
-        device=source.device,
-    )
-
     if expert_map is None:
         scratch.route_experts.copy_(topk_ids.reshape(-1))
     else:
@@ -401,11 +410,93 @@ def run_trellis_w4a8_moe(
         scratch.up_quantized,
         topk=topk,
     )
-    run_trellis_w4a8_fc1_routes(
-        scratch.gate_quantized,
-        scratch.up_quantized,
+    return TrellisW4A8PreparedInput(
+        route_experts=scratch.route_experts,
+        gate_quantized=scratch.gate_quantized,
+        up_quantized=scratch.up_quantized,
+        m=m,
+        topk=topk,
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        shared_suh=shared_suh,
+        gate_suh=prepared.gate_suh,
+        up_suh=prepared.up_suh,
+    )
+
+
+def run_trellis_w4a8_moe_prepared(
+    prepared_input: TrellisW4A8PreparedInput,
+    prepared: object,
+    topk_weights: torch.Tensor,
+    scratch: TrellisW4A8MoeScratch,
+    *,
+    fast_math: bool = False,
+) -> torch.Tensor:
+    """Run one 256-channel part from an already prepared routed input."""
+
+    m = prepared_input.m
+    topk = prepared_input.topk
+    hidden_size = prepared_input.hidden_size
+    routes = m * topk
+    num_experts, shared_suh = _validate_prepared_part(
         prepared,
-        scratch.route_experts,
+        hidden_size=hidden_size,
+        device=prepared_input.route_experts.device,
+    )
+    if (
+        num_experts != prepared_input.num_experts
+        or shared_suh is not prepared_input.shared_suh
+    ):
+        raise ValueError("prepared part has incompatible route/input geometry")
+    for name in ("gate_suh", "up_suh"):
+        if not _same_tensor_view(
+            getattr(prepared_input, name),
+            getattr(prepared, name),
+        ):
+            raise ValueError(f"prepared part does not share {name} identity")
+    if topk_weights.shape != (m, topk) or topk_weights.dtype != torch.float32:
+        raise TypeError("topk_weights must be contiguous FP32 with routing shape")
+    if not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous")
+    if topk_weights.device != prepared_input.route_experts.device:
+        raise ValueError("prepared input and topk_weights must share one CUDA device")
+    if (
+        scratch.route_experts is not prepared_input.route_experts
+        or scratch.gate_quantized is not prepared_input.gate_quantized
+        or scratch.up_quantized is not prepared_input.up_quantized
+    ):
+        raise ValueError("prepared input must be consumed with its source scratch")
+    _check_mxfp8_rows(
+        "scratch.activated_quantized",
+        scratch.activated_quantized,
+        m=routes,
+        k=256,
+        device=prepared_input.route_experts.device,
+    )
+    for name, tensor, shape in (
+        ("gate_fc1", scratch.gate_fc1, (routes, 256)),
+        ("up_fc1", scratch.up_fc1, (routes, 256)),
+        ("fc2", scratch.fc2, (routes, hidden_size)),
+    ):
+        _check_tensor(
+            f"scratch.{name}",
+            tensor,
+            shape=shape,
+            dtype=torch.float16,
+            device=prepared_input.route_experts.device,
+        )
+    _check_tensor(
+        "scratch.output",
+        scratch.output,
+        shape=(m, hidden_size),
+        dtype=torch.float32,
+        device=prepared_input.route_experts.device,
+    )
+    run_trellis_w4a8_fc1_routes(
+        prepared_input.gate_quantized,
+        prepared_input.up_quantized,
+        prepared,
+        prepared_input.route_experts,
         scratch.gate_fc1,
         scratch.up_fc1,
         topk=topk,
@@ -416,7 +507,7 @@ def run_trellis_w4a8_moe(
     run_trellis_w4a8_activation_rotation_quant(
         scratch.gate_fc1,
         scratch.up_fc1,
-        scratch.route_experts,
+        prepared_input.route_experts,
         prepared,
         scratch.activated_quantized,
         fast_math=fast_math,
@@ -424,7 +515,7 @@ def run_trellis_w4a8_moe(
     run_trellis_w4a8_fc2_routes(
         scratch.activated_quantized,
         prepared,
-        scratch.route_experts,
+        prepared_input.route_experts,
         scratch.fc2,
         sqg_direct_lut=True,
     )
@@ -439,15 +530,107 @@ def run_trellis_w4a8_moe(
         full_rotation=True,
         num_experts=num_experts,
         topk_weights=topk_weights,
-        route_expert_ids=scratch.route_experts,
+        route_expert_ids=prepared_input.route_experts,
         svh_table=prepared.down_svh,
     )
     return scratch.output
 
 
+def run_trellis_w4a8_moe_parts(
+    source: torch.Tensor,
+    prepared_parts: tuple[object, ...],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    scratch: TrellisW4A8MoeScratch,
+    *,
+    output_accum: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    fast_math: bool = False,
+) -> torch.Tensor:
+    """Run compatible 256-channel parts with one shared-input preparation."""
+
+    _validate_prepared_parts(source, prepared_parts)
+    m, hidden_size = map(int, source.shape)
+    if topk_ids.ndim != 2:
+        raise TypeError("topk_ids must be contiguous int32/int64 [M,top-k]")
+    expected_routing_shape = (m, int(topk_ids.shape[1]))
+    if (
+        topk_weights.shape != expected_routing_shape
+        or topk_weights.dtype != torch.float32
+    ):
+        raise TypeError("topk_weights must be contiguous FP32 with routing shape")
+    if not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous")
+    if topk_weights.device != source.device:
+        raise ValueError("source and routing tensors must share one CUDA device")
+    if len(prepared_parts) > 1 and output_accum is None:
+        raise ValueError("multipart W4A8 execution requires output_accum")
+    if output_accum is not None:
+        _check_tensor(
+            "output_accum",
+            output_accum,
+            shape=(m, hidden_size),
+            dtype=torch.float32,
+            device=source.device,
+        )
+        if len(prepared_parts) > 1 and _same_tensor_view(output_accum, scratch.output):
+            raise ValueError("multipart output_accum must not alias scratch.output")
+    prepared_input = prepare_trellis_w4a8_moe_input(
+        source,
+        prepared_parts[0],
+        topk_ids,
+        scratch,
+        expert_map=expert_map,
+    )
+    part_output = None
+    for index, prepared in enumerate(prepared_parts):
+        part_output = run_trellis_w4a8_moe_prepared(
+            prepared_input,
+            prepared,
+            topk_weights,
+            scratch,
+            fast_math=fast_math,
+        )
+        if output_accum is not None:
+            if index == 0:
+                output_accum.copy_(part_output)
+            else:
+                output_accum.add_(part_output)
+    if part_output is None:
+        raise RuntimeError("prepared W4A8 partition is empty")
+    return output_accum if output_accum is not None else part_output
+
+
+def run_trellis_w4a8_moe(
+    source: torch.Tensor,
+    prepared: object,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    scratch: TrellisW4A8MoeScratch,
+    *,
+    expert_map: torch.Tensor | None = None,
+    fast_math: bool = False,
+) -> torch.Tensor:
+    """Run one compact E4M3 trellis part through native W4A8 MMA."""
+
+    return run_trellis_w4a8_moe_parts(
+        source,
+        (prepared,),
+        topk_weights,
+        topk_ids,
+        scratch,
+        expert_map=expert_map,
+        fast_math=fast_math,
+    )
+
+
 __all__ = [
     "TrellisW4A8MoeScratch",
+    "TrellisW4A8PreparedInput",
     "make_trellis_w4a8_moe_scratch",
-    "view_trellis_w4a8_moe_scratch",
+    "prepare_trellis_w4a8_moe_input",
     "run_trellis_w4a8_moe",
+    "run_trellis_w4a8_moe_parts",
+    "run_trellis_w4a8_moe_prepared",
+    "view_trellis_w4a8_moe_scratch",
 ]
