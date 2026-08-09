@@ -12,16 +12,14 @@ from b12x.gemm.trellis_linear import api
 from b12x.gemm.trellis_linear import _small_m
 from b12x.gemm.trellis_linear._small_m import _default_num_sms
 from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
-from b12x._lib.quant.sqg_e4m3 import (
-    sqg_cheb_normal_e4m3_direct_lut_cpu,
-    sqg_xor_cheb_t12_direct_lut_cpu,
-)
+from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_direct_lut_cpu
 from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
 from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
 from b12x.moe._shared.kernels.trellis_w4a8_pair import (
+    TrellisW4A8FC1RoutesKernel,
     run_trellis_w4a8_fc1_routes,
     run_trellis_w4a8_fc2_routes,
 )
@@ -43,7 +41,6 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
 
 
 _MCG = np.uint64(0xCBAC1FED)
-_MUL1 = np.uint64(0x83DCD12D)
 _MASK = np.uint32(0x8FFF8FFF)
 _ORC = np.uint32(0x3B603B60)
 
@@ -53,6 +50,11 @@ def _sm12x_available() -> bool:
         return False
     major, minor = torch.cuda.get_device_capability()
     return major == 12 and minor in (0, 1)
+
+
+def test_route_major_fc1_rejects_incomplete_k_slice_geometry() -> None:
+    with pytest.raises(ValueError, match="positive multiple of 256"):
+        TrellisW4A8FC1RoutesKernel(hidden_size=128, sqg_direct_lut=True)
 
 
 def _hadamard128_reference(source: torch.Tensor) -> torch.Tensor:
@@ -82,50 +84,14 @@ def _decode_3inst_fp16(window: np.ndarray) -> np.ndarray:
     return (low.astype(np.float16) + high.astype(np.float16)).astype(np.float16)
 
 
-def _decode_mul1_e4m3_fp16(window: np.ndarray) -> np.ndarray:
-    product = ((window.astype(np.uint64) * _MUL1) & np.uint64(0xFFFFFFFF)).astype(
-        np.uint32
-    )
-    byte_sum = (
-        (product & np.uint32(0xFF)).astype(np.uint32)
-        + ((product >> np.uint32(8)) & np.uint32(0xFF))
-        + ((product >> np.uint32(16)) & np.uint32(0xFF))
-        + ((product >> np.uint32(24)) & np.uint32(0xFF))
-    )
-    accumulator = (byte_sum + np.uint32(0x6400)).astype(np.uint16).view(np.float16)
-    inv = np.array([0x1EEE], dtype=np.uint16).view(np.float16)[0]
-    bias = np.array([0xC931], dtype=np.uint16).view(np.float16)[0]
-    reconstructed = (
-        accumulator.astype(np.float64) * np.float64(inv) + np.float64(bias)
-    ).astype(np.float16)
-    return (
-        torch.from_numpy(np.asarray(reconstructed))
-        .to(torch.float8_e4m3fn)
-        .to(torch.float16)
-        .numpy()
-    )
 
 
 
 
 
 
-@lru_cache(maxsize=None)
-def _sqg_cheb_normal_e4m3_table(bits: int) -> np.ndarray:
-    if bits not in (2, 3, 4):
-        raise ValueError(f"unsupported SQG-Cheb test rate K{bits}")
-    rate_index = bits - 2
-    labels = sqg_cheb_normal_e4m3_direct_lut_cpu()[
-        rate_index << 16 : (rate_index + 1) << 16
-    ]
-    return labels.view(torch.float8_e4m3fn).to(torch.float16).numpy()
 
 
-def _decode_sqg_cheb_normal_e4m3_fp16(
-    window: np.ndarray, bits: int
-) -> np.ndarray:
-    indices = np.asarray(window, dtype=np.uint32) & np.uint32(0xFFFF)
-    return _sqg_cheb_normal_e4m3_table(bits)[indices]
 
 
 @lru_cache(maxsize=None)
@@ -169,10 +135,6 @@ def _decode_lane(
         )
         if codebook == "mcg":
             values.append(_decode_3inst_fp16(window))
-        elif codebook == "mul1-e4m3":
-            values.append(_decode_mul1_e4m3_fp16(window))
-        elif codebook == "sqg-cheb-normal-e4m3":
-            values.append(_decode_sqg_cheb_normal_e4m3_fp16(window, bits))
         elif codebook == "sqg_xor_cheb_t12":
             values.append(_decode_sqg_xor_cheb_t12_fp16(window, bits))
         else:
@@ -546,7 +508,14 @@ def test_k6_small_m_cuda_graph_replay_is_stable() -> None:
     x = torch.randn((m, features), dtype=torch.float16, device=device)
     output = torch.empty_like(x)
     rotated_f16 = torch.empty_like(x)
-    kwargs = {"output": output, "rotated_f16": rotated_f16}
+    gemm_output = torch.empty_like(x)
+    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+    kwargs = {
+        "output": output,
+        "gemm_output": gemm_output,
+        "c_tmp": c_tmp,
+        "rotated_f16": rotated_f16,
+    }
 
     expected = trellis_linear.run(x, weight, **kwargs).clone()
     torch.cuda.synchronize(device)
@@ -623,73 +592,12 @@ def test_dense_bf16_reuses_all_scratch_during_cuda_graph_capture(bits: int) -> N
     assert torch.equal(captured, expected)
 
 
-@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
-@pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_mul1_e4m3_matches_reference(bits: int) -> None:
-    torch.manual_seed(0xE4A3 + bits)
-    device = torch.device("cuda", torch.cuda.current_device())
-    m = 2
-    features = 128
-    trellis = torch.randint(
-        -32768,
-        32767,
-        (features // 16, features // 16, 16 * bits),
-        dtype=torch.int16,
-        device=device,
-    )
-    scale = torch.ones(features, dtype=torch.float16, device=device)
-    weight = trellis_linear.prepare_weight(
-        trellis,
-        scale,
-        scale.clone(),
-        mul1_e4m3=torch.tensor(
-            0x83DCD12D, dtype=torch.uint32, device=device
-        ),
-        params_dtype=torch.float16,
-    )
-    assert weight.trellis_codebook == "mul1-e4m3"
-    reference_weight = _reconstruct_native(
-        trellis, codebook="mul1-e4m3"
-    ).to(device)
-    x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
-
-    def identity_hadamard(
-        source: torch.Tensor,
-        destination: torch.Tensor,
-        _left_scale,
-        _right_scale,
-        _scale: float,
-    ) -> None:
-        destination.copy_(source)
-
-    output = torch.empty_like(x)
-    gemm_output = torch.empty_like(x)
-    rotated_f16 = torch.empty_like(x)
-    c_tmp = torch.empty((1 << 20,), dtype=torch.float32, device=device)
-    actual = trellis_linear.run(
-        x,
-        weight,
-        output=output,
-        gemm_output=gemm_output,
-        rotated_f16=rotated_f16,
-        c_tmp=c_tmp,
-        hadamard_128=identity_hadamard,
-    ).clone()
-    torch.cuda.synchronize(device)
-
-    expected = (x.float() @ reference_weight.float()).to(torch.float16)
-    relative_error = (actual - expected).float().norm() / expected.float().norm()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.float().flatten(), expected.float().flatten(), dim=0
-    )
-    assert float(relative_error) <= 2.0e-2
-    assert float(cosine) >= 0.999
 
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("bits", [2, 3, 4])
-def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
-    """Close the exact SQG labels through the real W4A16 GEMM fragment path."""
+def test_dense_sqg_xor_cheb_t12_matches_reference(bits: int) -> None:
+    """Close exact SQG-XOR-Cheb-T12 labels through the W4A16 GEMM fragment."""
 
     torch.manual_seed(0x535147 + bits)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -707,12 +615,12 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
         trellis,
         scale,
         scale.clone(),
-        codebook="sqg-cheb-normal-e4m3",
+        codebook="sqg_xor_cheb_t12",
         params_dtype=torch.float16,
     )
-    assert weight.trellis_codebook == "sqg-cheb-normal-e4m3"
+    assert weight.trellis_codebook == "sqg_xor_cheb_t12"
     reference_weight = _reconstruct_native(
-        trellis, codebook="sqg-cheb-normal-e4m3"
+        trellis, codebook="sqg_xor_cheb_t12"
     ).to(device)
     x = (torch.randn((m, features), device=device) * 1.0e-3).to(torch.float16)
 
@@ -757,7 +665,7 @@ def test_dense_sqg_cheb_normal_e4m3_matches_reference(bits: int) -> None:
     [16, 224],
     ids=["square-proof", "k3-tp12"],
 )
-@pytest.mark.parametrize("codebook", ["mcg", "sqg-cheb-normal-e4m3"])
+@pytest.mark.parametrize("codebook", ["mcg", "sqg_xor_cheb_t12"])
 def test_dense_pair_matches_independent_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],
@@ -900,7 +808,7 @@ def test_dense_pair_matches_independent_reference_and_captures(
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize(("pair_kind", "bits"), [("P24", (2, 4)), ("P33", (3, 3))])
 @pytest.mark.parametrize("rate_axis", ["k", "n"])
-@pytest.mark.parametrize("codebook", ["mul1-e4m3", "sqg-cheb-normal-e4m3"])
+@pytest.mark.parametrize("codebook", ["sqg_xor_cheb_t12"])
 def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
     pair_kind: str,
     bits: tuple[int, int],
@@ -959,15 +867,7 @@ def test_dense_pair_e4m3_w4a8_matches_quantized_reference_and_captures(
 
     payload = torch.cat((low.reshape(-1), high.reshape(-1))).contiguous()
     size_k, size_n = reference_weight.shape
-    codebook_kwargs = (
-        {
-            "mul1_e4m3": torch.tensor(
-                0x83DCD12D, dtype=torch.uint32, device=device
-            )
-        }
-        if codebook == "mul1-e4m3"
-        else {"codebook": codebook}
-    )
+    codebook_kwargs = {"codebook": codebook}
     weight = trellis_linear.prepare_pair_weight(
         payload,
         torch.ones(size_k, dtype=torch.float16, device=device),
@@ -1131,7 +1031,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     torch.manual_seed(20260803)
     device = torch.device("cuda", torch.cuda.current_device())
     experts = 2
-    hidden = 128
+    hidden = 256
     intermediate = 256
     hidden_tiles = hidden // 16
     n_tiles = hidden // 16
