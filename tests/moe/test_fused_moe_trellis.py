@@ -118,6 +118,17 @@ def test_trellis_w4a8_rejects_mixed_suh_modes_and_token_scratch_for_routes() -> 
         run_trellis_w4a8_moe(source, prepared, weights, ids, shared_scratch)
 
 
+def test_trellis_w4a8_scratch_rejects_incomplete_fc1_geometry() -> None:
+    with pytest.raises(ValueError, match="positive multiple of 256"):
+        make_trellis_w4a8_moe_scratch(
+            m=1,
+            topk=1,
+            hidden_size=128,
+            intermediate_size=256,
+            device="cpu",
+        )
+
+
 @pytest.mark.parametrize("down_rows", [1, 4])
 def test_trellis_w4a8_multipart_prepares_shared_input_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -212,6 +223,48 @@ def test_trellis_w4a8_multipart_prepares_shared_input_once(
         "sum": 2,
     }
     torch.testing.assert_close(actual, torch.full_like(actual, 3.0))
+
+
+def test_trellis_w4a8_multipart_rejects_overlapping_accumulation() -> None:
+    m = topk = 2
+    hidden = 1024
+    experts = 4
+    source = torch.zeros((m, hidden), dtype=torch.float16)
+    ids = torch.zeros((m, topk), dtype=torch.int32)
+    weights = torch.ones((m, topk), dtype=torch.float32)
+    gate_suh = torch.ones((1, hidden), dtype=torch.float16)
+    up_suh = torch.ones((1, hidden), dtype=torch.float16)
+    down_svh = torch.ones((1, hidden), dtype=torch.float16)
+    prepared = SimpleNamespace(
+        hidden_size=hidden,
+        intermediate_size=256,
+        num_experts=experts,
+        trellis_codebook="sqg_xor_cheb_t12",
+        activation="silu",
+        shared_suh=True,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        down_svh=down_svh,
+    )
+    scratch = make_trellis_w4a8_moe_scratch(
+        m=m,
+        topk=topk,
+        hidden_size=hidden,
+        intermediate_size=256,
+        device="cpu",
+    )
+    backing = torch.empty((m + 1, hidden), dtype=torch.float32)
+    overlapping_scratch = replace(scratch, output=backing[:m])
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        run_trellis_w4a8_moe_parts(
+            source,
+            (prepared, prepared),
+            weights,
+            ids,
+            overlapping_scratch,
+            output_accum=backing[1:],
+        )
 
 
 @pytest.mark.parametrize("fault", ["dtype", "device", "shape", "contiguity"])
@@ -1518,6 +1571,26 @@ def test_qsrt_atom_prepare_rejects_malformed_payloads_and_metadata() -> None:
     assert public_prepared.fc1_trellis_pair_kind == "PDYNAMIC"
     assert public_prepared.fc2_trellis_pair_kind == "PDYNAMIC"
 
+    overflow_prepared = prepare_qsrt_atom_moe_weights(
+        atoms,
+        **(
+            kwargs
+            | {
+                "first_atom_slot": 0,
+                "layer_index": 0,
+                "expert_ids": torch.tensor([2, 3], dtype=torch.int32, device=device),
+                "format_codes": torch.tensor(
+                    [0x10, 0x00], dtype=torch.uint8, device=device
+                ),
+                "rotation_multiplier": 1_500_000_000,
+            }
+        ),
+    )
+    assert torch.equal(
+        overflow_prepared.fc1_trellis_pair_modes,
+        torch.tensor([1, 0], dtype=torch.int32, device=device),
+    )
+
     with pytest.raises(ValueError, match="atom_payload must have shape"):
         prepare_qsrt_atom_moe_weights(atoms[..., :-1].contiguous(), **kwargs)
     with pytest.raises(ValueError, match="pair-aligned"):
@@ -1530,6 +1603,30 @@ def test_qsrt_atom_prepare_rejects_malformed_payloads_and_metadata() -> None:
                 | {
                     "format_codes": torch.tensor(
                         [0x30, 0x01], dtype=torch.uint8, device=device
+                    )
+                }
+            ),
+        )
+    with pytest.raises(ValueError, match="format codes"):
+        prepare_qsrt_atom_moe_weights(
+            atoms,
+            **(
+                kwargs
+                | {
+                    "format_codes": torch.tensor(
+                        [2**32, 0x01], dtype=torch.int64, device=device
+                    )
+                }
+            ),
+        )
+    with pytest.raises(ValueError, match="expert_ids must lie"):
+        prepare_qsrt_atom_moe_weights(
+            atoms,
+            **(
+                kwargs
+                | {
+                    "expert_ids": torch.tensor(
+                        [2**32, 0], dtype=torch.int64, device=device
                     )
                 }
             ),

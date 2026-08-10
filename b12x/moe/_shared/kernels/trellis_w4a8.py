@@ -81,8 +81,8 @@ def make_trellis_w4a8_moe_scratch(
     shared_suh = bool(shared_suh)
     if m <= 0 or topk <= 0:
         raise ValueError("m and topk must be positive")
-    if hidden_size <= 0 or hidden_size % 128:
-        raise ValueError("hidden_size must be a positive multiple of 128")
+    if hidden_size <= 0 or hidden_size % 256:
+        raise ValueError("hidden_size must be a positive multiple of 256")
     if intermediate_size != 256:
         raise ValueError(
             "the initial TP12 QSRT W4A8 path requires "
@@ -298,6 +298,16 @@ def _same_tensor_view(left: torch.Tensor, right: torch.Tensor) -> bool:
         and left.dtype == right.dtype
         and left.device == right.device
     )
+
+
+def _tensor_views_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    if left.device != right.device or left.numel() == 0 or right.numel() == 0:
+        return False
+    left_start = int(left.data_ptr())
+    right_start = int(right.data_ptr())
+    left_end = left_start + left.numel() * left.element_size()
+    right_end = right_start + right.numel() * right.element_size()
+    return left_start < right_end and right_start < left_end
 
 
 def _validate_prepared_parts(
@@ -567,8 +577,10 @@ def run_trellis_w4a8_moe_parts(
             dtype=torch.float32,
             device=source.device,
         )
-        if len(prepared_parts) > 1 and _same_tensor_view(output_accum, scratch.output):
-            raise ValueError("multipart output_accum must not alias scratch.output")
+        if len(prepared_parts) > 1 and _tensor_views_overlap(
+            output_accum, scratch.output
+        ):
+            raise ValueError("multipart output_accum must not overlap scratch.output")
     prepared_input = prepare_trellis_w4a8_moe_input(
         source,
         prepared_parts[0],

@@ -442,14 +442,16 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
         topk_ids: cute.Tensor,
         expert_map: cute.Tensor,
         route: Int32,
+        num_experts: Int32,
         global_experts: Int32,
     ) -> Int32:
         raw_expert = topk_ids[route].to(Int64)
-        expert = raw_expert.to(Int32)
+        expert = Int32(-1)
         if cutlass.const_expr(self.use_expert_map):
-            expert = Int32(-1)
             if raw_expert >= Int64(0) and raw_expert < Int64(global_experts):
                 expert = expert_map[raw_expert].to(Int32)
+        elif raw_expert >= Int64(0) and raw_expert < Int64(num_experts):
+            expert = raw_expert.to(Int32)
         return expert
 
     @cute.kernel
@@ -483,7 +485,11 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             route_stride = Int32(gdim) * Int32(self.threads)
             while route_fill < routes:
                 route_experts[route_fill] = self._mapped_expert(
-                    topk_ids, expert_map, route_fill, global_experts
+                    topk_ids,
+                    expert_map,
+                    route_fill,
+                    num_experts,
+                    global_experts,
                 )
                 route_fill += route_stride
         gwarp = Int32(bidx) * Int32(self.threads // 32) + warp
@@ -500,7 +506,11 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             if cutlass.const_expr(not self.broadcast_suh):
                 token = route // Int32(self.topk)
                 expert = self._mapped_expert(
-                    topk_ids, expert_map, route, global_experts
+                    topk_ids,
+                    expert_map,
+                    route,
+                    num_experts,
+                    global_experts,
                 )
                 if blk == Int32(0) and lane == Int32(0):
                     route_experts[route] = expert
@@ -852,8 +862,13 @@ class TrellisW4A8ActivationRotationQuantKernel(
                 )
 
 
-def _ptr(dtype, address: int):
-    return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=16)
+def _ptr(dtype, address: int, *, assumed_align: int = 16):
+    return make_ptr(
+        dtype,
+        address,
+        cute.AddressSpace.gmem,
+        assumed_align=assumed_align,
+    )
 
 
 @functools.cache
@@ -919,8 +934,10 @@ def _compile_input_rotation_quant(
         raise TypeError(f"trellis W4A8 input must be bf16/fp16, got {source_dtype}")
     if route_dtype == torch.int32:
         route_id_type = cutlass.Int32
+        route_alignment = 4
     elif route_dtype == torch.int64:
         route_id_type = cutlass.Int64
+        route_alignment = 8
     else:
         raise TypeError(
             f"trellis W4A8 route ids must be int32/int64, got {route_dtype}"
@@ -946,8 +963,8 @@ def _compile_input_rotation_quant(
     return b12x_compile(
         launch,
         _ptr(source_type, 16),
-        _ptr(route_id_type, 16),
-        _ptr(cutlass.Int32, 16),
+        _ptr(route_id_type, 16, assumed_align=route_alignment),
+        _ptr(cutlass.Int32, 16, assumed_align=4),
         _ptr(cutlass.Int32, 16),
         _ptr(cutlass.Float16, 16),
         _ptr(cutlass.Float16, 16),
@@ -1085,8 +1102,12 @@ def run_trellis_w4a8_input_rotation_quant(
     map_tensor = route_experts if expert_map is None else expert_map
     compiled(
         _ptr(source_type, source.data_ptr()),
-        _ptr(route_id_type, topk_ids.data_ptr()),
-        _ptr(cutlass.Int32, map_tensor.data_ptr()),
+        _ptr(
+            route_id_type,
+            topk_ids.data_ptr(),
+            assumed_align=topk_ids.element_size(),
+        ),
+        _ptr(cutlass.Int32, map_tensor.data_ptr(), assumed_align=4),
         _ptr(cutlass.Int32, route_experts.data_ptr()),
         _ptr(cutlass.Float16, prepared.gate_suh.data_ptr()),
         _ptr(cutlass.Float16, prepared.up_suh.data_ptr()),
