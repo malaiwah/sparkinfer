@@ -385,30 +385,23 @@ def prepare_trellis_w4a8_moe_input(
         k=hidden_size,
         device=source.device,
     )
-    if expert_map is None:
-        scratch.route_experts.copy_(topk_ids.reshape(-1))
-    else:
-        if (
-            expert_map.ndim != 1
-            or expert_map.dtype != torch.int32
-            or expert_map.device != source.device
-            or not expert_map.is_contiguous()
-        ):
-            raise TypeError(
-                "expert_map must be contiguous int32 [global experts] on source device"
-            )
-        torch.index_select(
-            expert_map,
-            0,
-            topk_ids.reshape(-1),
-            out=scratch.route_experts,
+    if expert_map is not None and (
+        expert_map.ndim != 1
+        or expert_map.dtype != torch.int32
+        or expert_map.device != source.device
+        or not expert_map.is_contiguous()
+    ):
+        raise TypeError(
+            "expert_map must be contiguous int32 [global experts] on source device"
         )
     run_trellis_w4a8_input_rotation_quant(
         source,
+        topk_ids,
         scratch.route_experts,
         prepared,
         scratch.gate_quantized,
         scratch.up_quantized,
+        expert_map=expert_map,
         topk=topk,
     )
     return TrellisW4A8PreparedInput(

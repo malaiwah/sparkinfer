@@ -8,7 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Float32, Int32, Uint8, Uint32
+from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint8, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
@@ -96,9 +96,7 @@ class _NativeMXFP8:
                 cute.arch.shuffle_sync_bfly(max_abs, offset=1 << shift),
             )
 
-        _, scale_byte = pow2_ceil_ue8m0(
-            max_abs * Float32(1.0 / FLOAT8_E4M3_MAX)
-        )
+        _, scale_byte = pow2_ceil_ue8m0(max_abs * Float32(1.0 / FLOAT8_E4M3_MAX))
         if max_abs == Float32(0.0):
             scale_byte = Uint32(127)
         inv_scale = ue8m0_to_output_scale(scale_byte)
@@ -215,9 +213,7 @@ class TrellisW4A8InputRotationKernel(_Hadamard128):
             source_ptr,
             cute.make_ordered_layout((tokens, self.hidden_size), order=(1, 0)),
         )
-        route_experts = cute.make_tensor(
-            route_experts_ptr, cute.make_layout((routes,))
-        )
+        route_experts = cute.make_tensor(route_experts_ptr, cute.make_layout((routes,)))
         suh_rows = Int32(1) if self.broadcast_suh else num_experts
         gate_suh = cute.make_tensor(
             gate_suh_ptr,
@@ -247,9 +243,7 @@ class TrellisW4A8InputRotationKernel(_Hadamard128):
             up_out,
             tokens,
             num_experts,
-        ).launch(
-            grid=(grid_x, 1, 1), block=[self.threads, 1, 1], stream=stream
-        )
+        ).launch(grid=(grid_x, 1, 1), block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -338,18 +332,24 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
         hidden_size: int,
         topk: int,
         source_type: type[cutlass.Numeric],
+        route_id_type: type[cutlass.Numeric],
         broadcast_suh: bool,
+        use_expert_map: bool,
     ) -> None:
         self.hidden_size = int(hidden_size)
         self.groups_k = self.hidden_size // 32
         self.topk = int(topk)
         self.source_type = source_type
+        self.route_id_type = route_id_type
         self.broadcast_suh = bool(broadcast_suh)
+        self.use_expert_map = bool(use_expert_map)
 
     @cute.jit
     def __call__(
         self,
         source_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
+        expert_map_ptr: cute.Pointer,
         route_experts_ptr: cute.Pointer,
         gate_suh_ptr: cute.Pointer,
         up_suh_ptr: cute.Pointer,
@@ -361,6 +361,7 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
         up_scale_mma_ptr: cute.Pointer,
         tokens: Int32,
         num_experts: Int32,
+        global_experts: Int32,
         stream: cuda.CUstream,
     ) -> None:
         routes = tokens * Int32(self.topk)
@@ -369,9 +370,11 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             source_ptr,
             cute.make_ordered_layout((tokens, self.hidden_size), order=(1, 0)),
         )
-        route_experts = cute.make_tensor(
-            route_experts_ptr, cute.make_layout((routes,))
+        topk_ids = cute.make_tensor(topk_ids_ptr, cute.make_layout((routes,)))
+        expert_map = cute.make_tensor(
+            expert_map_ptr, cute.make_layout((global_experts,))
         )
+        route_experts = cute.make_tensor(route_experts_ptr, cute.make_layout((routes,)))
         suh_rows = Int32(1) if self.broadcast_suh else num_experts
         gate_suh = cute.make_tensor(
             gate_suh_ptr,
@@ -413,6 +416,8 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
         units = output_rows * Int32(self.hidden_size // 128)
         self.kernel(
             source,
+            topk_ids,
+            expert_map,
             route_experts,
             gate_suh,
             up_suh,
@@ -424,16 +429,35 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             up_scale_mma,
             tokens,
             num_experts,
+            global_experts,
         ).launch(
             grid=(cute.ceil_div(units, warps), 1, 1),
             block=[self.threads, 1, 1],
             stream=stream,
         )
 
+    @cute.jit
+    def _mapped_expert(
+        self,
+        topk_ids: cute.Tensor,
+        expert_map: cute.Tensor,
+        route: Int32,
+        global_experts: Int32,
+    ) -> Int32:
+        raw_expert = topk_ids[route].to(Int64)
+        expert = raw_expert.to(Int32)
+        if cutlass.const_expr(self.use_expert_map):
+            expert = Int32(-1)
+            if raw_expert >= Int64(0) and raw_expert < Int64(global_experts):
+                expert = expert_map[raw_expert].to(Int32)
+        return expert
+
     @cute.kernel
     def kernel(
         self,
         source: cute.Tensor,
+        topk_ids: cute.Tensor,
+        expert_map: cute.Tensor,
         route_experts: cute.Tensor,
         gate_suh: cute.Tensor,
         up_suh: cute.Tensor,
@@ -445,14 +469,24 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
         up_scale_mma: cute.Tensor,
         tokens: Int32,
         num_experts: Int32,
+        global_experts: Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
         tid = Int32(tidx)
         lane = tid & Int32(31)
         warp = tid >> Int32(5)
-        gwarp = Int32(bidx) * Int32(self.threads // 32) + warp
         routes = tokens * Int32(self.topk)
+        if cutlass.const_expr(self.broadcast_suh):
+            route_fill = Int32(bidx) * Int32(self.threads) + tid
+            route_stride = Int32(gdim) * Int32(self.threads)
+            while route_fill < routes:
+                route_experts[route_fill] = self._mapped_expert(
+                    topk_ids, expert_map, route_fill, global_experts
+                )
+                route_fill += route_stride
+        gwarp = Int32(bidx) * Int32(self.threads // 32) + warp
         nblk = Int32(self.hidden_size // 128)
         output_rows = tokens if cutlass.const_expr(self.broadcast_suh) else routes
         total = output_rows * nblk
@@ -465,7 +499,11 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             valid = Int32(1)
             if cutlass.const_expr(not self.broadcast_suh):
                 token = route // Int32(self.topk)
-                expert = route_experts[route].to(Int32)
+                expert = self._mapped_expert(
+                    topk_ids, expert_map, route, global_experts
+                )
+                if blk == Int32(0) and lane == Int32(0):
+                    route_experts[route] = expert
                 valid = Int32(0)
                 if expert >= Int32(0) and expert < num_experts:
                     valid = Int32(1)
@@ -479,9 +517,7 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             x1 = cutlass.Float16(source[token, col + Int32(1)]).to(Float32)
             x2 = cutlass.Float16(source[token, col + Int32(2)]).to(Float32)
             x3 = cutlass.Float16(source[token, col + Int32(3)]).to(Float32)
-            g0 = cutlass.Float16(x0 * gate_suh[scale_row, col].to(Float32)).to(
-                Float32
-            )
+            g0 = cutlass.Float16(x0 * gate_suh[scale_row, col].to(Float32)).to(Float32)
             g1 = cutlass.Float16(
                 x1 * gate_suh[scale_row, col + Int32(1)].to(Float32)
             ).to(Float32)
@@ -491,18 +527,16 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
             g3 = cutlass.Float16(
                 x3 * gate_suh[scale_row, col + Int32(3)].to(Float32)
             ).to(Float32)
-            u0 = cutlass.Float16(x0 * up_suh[scale_row, col].to(Float32)).to(
+            u0 = cutlass.Float16(x0 * up_suh[scale_row, col].to(Float32)).to(Float32)
+            u1 = cutlass.Float16(x1 * up_suh[scale_row, col + Int32(1)].to(Float32)).to(
                 Float32
             )
-            u1 = cutlass.Float16(
-                x1 * up_suh[scale_row, col + Int32(1)].to(Float32)
-            ).to(Float32)
-            u2 = cutlass.Float16(
-                x2 * up_suh[scale_row, col + Int32(2)].to(Float32)
-            ).to(Float32)
-            u3 = cutlass.Float16(
-                x3 * up_suh[scale_row, col + Int32(3)].to(Float32)
-            ).to(Float32)
+            u2 = cutlass.Float16(x2 * up_suh[scale_row, col + Int32(2)].to(Float32)).to(
+                Float32
+            )
+            u3 = cutlass.Float16(x3 * up_suh[scale_row, col + Int32(3)].to(Float32)).to(
+                Float32
+            )
             if valid == Int32(0):
                 g0 = Float32(0.0)
                 g1 = Float32(0.0)
@@ -514,12 +548,8 @@ class TrellisW4A8InputRotationQuantKernel(_Hadamard128, _NativeMXFP8):
                 u3 = Float32(0.0)
             gh0, gh1, gh2, gh3 = self._had128_quad(g0, g1, g2, g3, lane)
             uh0, uh1, uh2, uh3 = self._had128_quad(u0, u1, u2, u3, lane)
-            gate_payload, gate_scale = self._pack_native_mxfp8(
-                gh0, gh1, gh2, gh3, lane
-            )
-            up_payload, up_scale = self._pack_native_mxfp8(
-                uh0, uh1, uh2, uh3, lane
-            )
+            gate_payload, gate_scale = self._pack_native_mxfp8(gh0, gh1, gh2, gh3, lane)
+            up_payload, up_scale = self._pack_native_mxfp8(uh0, uh1, uh2, uh3, lane)
             subgroup = lane >> Int32(3)
             lane8 = lane & Int32(7)
             group = blk * Int32(4) + subgroup
@@ -601,9 +631,7 @@ class TrellisW4A8ActivationRotationKernel(_Hadamard128):
             rotations_ptr,
             cute.make_ordered_layout((num_experts, 3 * 256), order=(1, 0)),
         )
-        route_experts = cute.make_tensor(
-            route_experts_ptr, cute.make_layout((routes,))
-        )
+        route_experts = cute.make_tensor(route_experts_ptr, cute.make_layout((routes,)))
         output = cute.make_tensor(
             output_ptr, cute.make_ordered_layout((routes, 256), order=(1, 0))
         )
@@ -715,9 +743,7 @@ class TrellisW4A8ActivationRotationQuantKernel(
             rotations_ptr,
             cute.make_ordered_layout((num_experts, 3 * 256), order=(1, 0)),
         )
-        route_experts = cute.make_tensor(
-            route_experts_ptr, cute.make_layout((routes,))
-        )
+        route_experts = cute.make_tensor(route_experts_ptr, cute.make_layout((routes,)))
         values = cute.make_tensor(
             values_ptr, cute.make_ordered_layout((routes, 256 // 4), order=(1, 0))
         )
@@ -810,9 +836,7 @@ class TrellisW4A8ActivationRotationQuantKernel(
                 a2 = Float32(0.0)
                 a3 = Float32(0.0)
             o0, o1, o2, o3 = self._had128_quad(a0, a1, a2, a3, lane)
-            payload, scale_byte = self._pack_native_mxfp8(
-                o0, o1, o2, o3, lane
-            )
+            payload, scale_byte = self._pack_native_mxfp8(o0, o1, o2, o3, lane)
             subgroup = lane >> Int32(3)
             lane8 = lane & Int32(7)
             group = blk * Int32(4) + subgroup
@@ -882,7 +906,9 @@ def _compile_input_rotation_quant(
     hidden_size: int,
     topk: int,
     source_dtype: torch.dtype,
+    route_dtype: torch.dtype,
     broadcast_suh: bool,
+    use_expert_map: bool,
     device_index: int,
 ):
     if source_dtype == torch.bfloat16:
@@ -891,23 +917,37 @@ def _compile_input_rotation_quant(
         source_type = cutlass.Float16
     else:
         raise TypeError(f"trellis W4A8 input must be bf16/fp16, got {source_dtype}")
+    if route_dtype == torch.int32:
+        route_id_type = cutlass.Int32
+    elif route_dtype == torch.int64:
+        route_id_type = cutlass.Int64
+    else:
+        raise TypeError(
+            f"trellis W4A8 route ids must be int32/int64, got {route_dtype}"
+        )
     launch = TrellisW4A8InputRotationQuantKernel(
         hidden_size=hidden_size,
         topk=topk,
         source_type=source_type,
+        route_id_type=route_id_type,
         broadcast_suh=broadcast_suh,
+        use_expert_map=use_expert_map,
     )
     key = (
         int(hidden_size),
         int(topk),
         str(source_dtype),
+        str(route_dtype),
         bool(broadcast_suh),
+        bool(use_expert_map),
         int(device_index),
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,
         _ptr(source_type, 16),
+        _ptr(route_id_type, 16),
+        _ptr(cutlass.Int32, 16),
         _ptr(cutlass.Int32, 16),
         _ptr(cutlass.Float16, 16),
         _ptr(cutlass.Float16, 16),
@@ -919,17 +959,16 @@ def _compile_input_rotation_quant(
         _ptr(cutlass.Uint8, 16),
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "moe.trellis_w4a8_input_rotation_quant", 1, key
+            "moe.trellis_w4a8_input_rotation_quant", 2, key
         ),
     )
 
 
 @functools.cache
-def _compile_activation_rotation(
-    fast_math: bool, activation: str, device_index: int
-):
+def _compile_activation_rotation(fast_math: bool, activation: str, device_index: int):
     launch = TrellisW4A8ActivationRotationKernel(
         activation=activation, fast_math=fast_math
     )
@@ -1000,7 +1039,10 @@ def run_trellis_w4a8_input_rotation(
         _device_index(source.device),
     )
     compiled(
-        _ptr(cutlass.BFloat16 if source.dtype == torch.bfloat16 else cutlass.Float16, source.data_ptr()),
+        _ptr(
+            cutlass.BFloat16 if source.dtype == torch.bfloat16 else cutlass.Float16,
+            source.data_ptr(),
+        ),
         _ptr(cutlass.Int32, route_experts.data_ptr()),
         _ptr(cutlass.Float16, prepared.gate_suh.data_ptr()),
         _ptr(cutlass.Float16, prepared.up_suh.data_ptr()),
@@ -1014,28 +1056,37 @@ def run_trellis_w4a8_input_rotation(
 
 def run_trellis_w4a8_input_rotation_quant(
     source: torch.Tensor,
+    topk_ids: torch.Tensor,
     route_experts: torch.Tensor,
     prepared,
     gate_out,
     up_out,
     *,
+    expert_map: torch.Tensor | None = None,
     topk: int,
 ) -> None:
-    """Apply both input rotations directly into native-order MXFP8 rows."""
+    """Materialize routes while rotating and quantizing both input projections."""
 
     broadcast_suh = int(prepared.gate_suh.shape[0]) == 1
+    use_expert_map = expert_map is not None
     compiled = _compile_input_rotation_quant(
         int(prepared.hidden_size),
         int(topk),
         source.dtype,
+        topk_ids.dtype,
         broadcast_suh,
+        use_expert_map,
         _device_index(source.device),
     )
     source_type = (
         cutlass.BFloat16 if source.dtype == torch.bfloat16 else cutlass.Float16
     )
+    route_id_type = cutlass.Int32 if topk_ids.dtype == torch.int32 else cutlass.Int64
+    map_tensor = route_experts if expert_map is None else expert_map
     compiled(
         _ptr(source_type, source.data_ptr()),
+        _ptr(route_id_type, topk_ids.data_ptr()),
+        _ptr(cutlass.Int32, map_tensor.data_ptr()),
         _ptr(cutlass.Int32, route_experts.data_ptr()),
         _ptr(cutlass.Float16, prepared.gate_suh.data_ptr()),
         _ptr(cutlass.Float16, prepared.up_suh.data_ptr()),
@@ -1047,6 +1098,7 @@ def run_trellis_w4a8_input_rotation_quant(
         _ptr(cutlass.Uint8, up_out.scale_mma.data_ptr()),
         int(source.shape[0]),
         int(prepared.num_experts),
+        int(map_tensor.numel()),
         current_cuda_stream(),
     )
 

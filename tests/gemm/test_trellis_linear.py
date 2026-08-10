@@ -1239,6 +1239,7 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
         source, prepared, topk_weights, topk_ids, scratch
     ).clone()
     torch.cuda.synchronize(device)
+    assert torch.equal(scratch.route_experts, route_experts)
 
     source_routes = source.to(torch.float16).repeat_interleave(2, dim=0)
     gate_rot_ref = _hadamard128_reference(
@@ -1319,6 +1320,17 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     ).clone()
     torch.cuda.synchronize(device)
     assert torch.equal(mapped, actual)
+    assert torch.equal(scratch.route_experts, route_experts)
+    mapped_i64 = run_trellis_w4a8_moe(
+        source,
+        prepared,
+        topk_weights,
+        global_ids.to(torch.int64),
+        scratch,
+        expert_map=expert_map,
+    ).clone()
+    assert torch.equal(mapped_i64, actual)
+    assert torch.equal(scratch.route_experts, route_experts)
 
     # A route owned by the other hybrid tier maps to -1 and contributes zero.
     partial_global_ids = torch.tensor(
@@ -1332,6 +1344,10 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
         scratch,
         expert_map=expert_map,
     ).clone()
+    assert torch.equal(
+        scratch.route_experts,
+        torch.tensor([0, -1], dtype=torch.int32, device=device),
+    )
     partial_expected = (
         canonical_routes[0]
         * prepared.down_svh[0].float()
@@ -1340,6 +1356,23 @@ def test_route_major_e4m3_w4a8_honors_separate_dynamic_pair_modes() -> None:
     torch.testing.assert_close(
         partial, partial_expected, rtol=4.0e-3, atol=3.0e-2
     )
+    invalid_global_ids = torch.tensor(
+        [[-1, expert_map.numel()]], dtype=torch.int64, device=device
+    )
+    invalid = run_trellis_w4a8_moe(
+        source,
+        prepared,
+        topk_weights,
+        invalid_global_ids,
+        scratch,
+        expert_map=expert_map,
+    ).clone()
+    assert torch.equal(
+        scratch.route_experts,
+        torch.full((2,), -1, dtype=torch.int32, device=device),
+    )
+    assert int(torch.count_nonzero(invalid)) == 0
+
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
