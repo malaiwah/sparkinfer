@@ -666,7 +666,15 @@ class _TensorAllocSpec:
     shape: Tuple[int, ...]
     dtype: torch.dtype
     init: str = "empty"
+    alignment: int = 16
+    reuse_group: str | None = None
 
+
+@dataclass(frozen=True)
+class _TensorArenaSlot:
+    specs: Tuple[_TensorAllocSpec, ...]
+    alignment: int
+    nbytes: int
 
 @dataclass(frozen=True, kw_only=True)
 class _TPCoreWorkspacePlan:
@@ -2727,6 +2735,15 @@ def _plan_core_workspace(
                 align_up(direct_cache2_nbytes, _dtype_nbytes(dtype))
                 // _dtype_nbytes(dtype),
             )
+        # Full-rotation FC1 consumes ``rotation_a_gate`` before the existing
+        # grid barrier lets activation write ``intermediate_cache2``.  FC2
+        # consumes that activation before the later top-k-sum launch writes
+        # ``full_rotation_output``.  Those three ranges are therefore
+        # sequential even though one captured dispatch owns all three views.
+        post_fc1_reuse_group = (
+            "w4a16_full_rotation_post_fc1" if full_rotation else None
+        )
+        max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
         cache_dtype = torch.float16 if full_rotation else dtype
         tensor_specs = [
             _TensorAllocSpec(
@@ -2738,9 +2755,45 @@ def _plan_core_workspace(
                 "intermediate_cache2",
                 (intermediate_cache2_elements,),
                 cache_dtype,
+                reuse_group=post_fc1_reuse_group,
             ),
-            _TensorAllocSpec("fc1_c_tmp", (fc1_c_tmp_elements,), torch.float32),
-            _TensorAllocSpec("fc2_c_tmp", (fc2_c_tmp_elements,), torch.float32),
+            *(
+                (
+                    _TensorAllocSpec(
+                        "full_rotation_output",
+                        (max_tokens, int(k)),
+                        torch.float32,
+                        reuse_group=post_fc1_reuse_group,
+                    ),
+                    _TensorAllocSpec(
+                        "rotation_a_gate",
+                        (routed_capacity, int(k)),
+                        torch.float16,
+                        reuse_group=post_fc1_reuse_group,
+                    ),
+                )
+                if full_rotation
+                else ()
+            ),
+            # Every non-direct W4A16 launch passes both accumulation scratches
+            # to the same cooperative fused kernel. Gated launches cross a
+            # grid barrier after FC1, run activation, cross the unconditional
+            # pre-FC2 grid barrier, and only then start FC2. Non-gated launches
+            # write their activated output directly and still cross that
+            # unconditional barrier. Small-M direct returns before either
+            # scratch is used, so the two live ranges are always disjoint.
+            _TensorAllocSpec(
+                "fc1_c_tmp",
+                (fc1_c_tmp_elements,),
+                torch.float32,
+                reuse_group="w4a16_c_tmp",
+            ),
+            _TensorAllocSpec(
+                "fc2_c_tmp",
+                (fc2_c_tmp_elements,),
+                torch.float32,
+                reuse_group="w4a16_c_tmp",
+            ),
             _TensorAllocSpec(
                 "packed_route_indices", (route_slots_capacity,), torch.int32
             ),
@@ -2749,20 +2802,9 @@ def _plan_core_workspace(
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
         ]
         if full_rotation:
-            max_tokens = max(routed_capacity // max(int(num_topk), 1), 1)
             tensor_specs.extend(
                 (
                     _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
-                    _TensorAllocSpec(
-                        "full_rotation_output",
-                        (max_tokens, int(k)),
-                        torch.float32,
-                    ),
-                    _TensorAllocSpec(
-                        "rotation_a_gate",
-                        (routed_capacity, int(k)),
-                        torch.float16,
-                    ),
                     _TensorAllocSpec(
                         "rotation_a_up",
                         (routed_capacity, int(k)),
@@ -3045,6 +3087,90 @@ def _plan_core_workspace(
     )
 
 
+def _tensor_alloc_alignment(spec: _TensorAllocSpec) -> int:
+    alignment = int(spec.alignment)
+    item_nbytes = _dtype_nbytes(spec.dtype)
+    if (
+        alignment < item_nbytes
+        or alignment < 1
+        or alignment & (alignment - 1)
+    ):
+        raise ValueError(
+            f"tensor {spec.name!r} alignment must be a power of two and at "
+            f"least its {item_nbytes}-byte element size, got {alignment}"
+        )
+    return alignment
+
+
+def _tensor_arena_slots(
+    specs: Tuple[_TensorAllocSpec, ...],
+) -> Tuple[_TensorArenaSlot, ...]:
+    names: set[str] = set()
+    reuse_members: Dict[str, list[_TensorAllocSpec]] = {}
+    reuse_positions: Dict[str, list[int]] = {}
+    for position, spec in enumerate(specs):
+        if spec.name in names:
+            raise ValueError(f"duplicate tensor allocation name {spec.name!r}")
+        names.add(spec.name)
+        _tensor_alloc_alignment(spec)
+        if spec.reuse_group is None:
+            continue
+        if not isinstance(spec.reuse_group, str) or not spec.reuse_group:
+            raise ValueError(
+                f"tensor {spec.name!r} has an invalid empty reuse group"
+            )
+        reuse_members.setdefault(spec.reuse_group, []).append(spec)
+        reuse_positions.setdefault(spec.reuse_group, []).append(position)
+
+    for group, members in reuse_members.items():
+        if len(members) < 2:
+            raise ValueError(
+                f"reuse group {group!r} must contain at least two tensors"
+            )
+        positions = reuse_positions[group]
+        if positions[-1] - positions[0] + 1 != len(positions):
+            raise ValueError(f"reuse group {group!r} must be contiguous")
+        first = members[0]
+        for member in members[1:]:
+            if member.dtype != first.dtype and first.init not in {"empty", "zeros"}:
+                raise ValueError(
+                    f"reuse group {group!r} has incompatible dtypes for "
+                    f"{first.init!r} initialization: {first.dtype} and {member.dtype}"
+                )
+            if member.init != first.init:
+                raise ValueError(
+                    f"reuse group {group!r} has incompatible init modes: "
+                    f"{first.init!r} and {member.init!r}"
+                )
+            if member.alignment != first.alignment:
+                raise ValueError(
+                    f"reuse group {group!r} has incompatible alignments: "
+                    f"{first.alignment} and {member.alignment}"
+                )
+
+    slots: list[_TensorArenaSlot] = []
+    emitted_groups: set[str] = set()
+    for spec in specs:
+        if spec.reuse_group is None:
+            members = (spec,)
+        else:
+            if spec.reuse_group in emitted_groups:
+                continue
+            emitted_groups.add(spec.reuse_group)
+            members = tuple(reuse_members[spec.reuse_group])
+        slots.append(
+            _TensorArenaSlot(
+                specs=members,
+                alignment=_tensor_alloc_alignment(members[0]),
+                nbytes=max(
+                    _tensor_numel(member.shape) * _dtype_nbytes(member.dtype)
+                    for member in members
+                ),
+            )
+        )
+    return tuple(slots)
+
+
 def _allocate_arena_tensor(
     shared_arena: torch.Tensor,
     offset: int,
@@ -3052,7 +3178,7 @@ def _allocate_arena_tensor(
     *,
     do_init: bool = True,
 ) -> tuple[torch.Tensor, int]:
-    alignment = max(16, _dtype_nbytes(spec.dtype))
+    alignment = _tensor_alloc_alignment(spec)
     offset = align_up(offset, alignment)
     nbytes = _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
     storage = shared_arena.narrow(0, offset, nbytes)
@@ -3082,12 +3208,20 @@ def _allocate_arena_tensor(
     return tensor, offset + nbytes
 
 
+def _arena_slots_nbytes(
+    slots: Tuple[_TensorArenaSlot, ...],
+    *,
+    offset_bytes: int = 0,
+) -> int:
+    arena_end = int(offset_bytes)
+    for slot in slots:
+        arena_end = align_up(arena_end, slot.alignment)
+        arena_end += slot.nbytes
+    return arena_end - int(offset_bytes)
+
+
 def _core_workspace_nbytes(plan: _TPCoreWorkspacePlan) -> int:
-    arena_nbytes = 0
-    for spec in plan.tensor_specs:
-        arena_nbytes = align_up(arena_nbytes, max(16, _dtype_nbytes(spec.dtype)))
-        arena_nbytes += _tensor_numel(spec.shape) * _dtype_nbytes(spec.dtype)
-    return int(arena_nbytes)
+    return _arena_slots_nbytes(_tensor_arena_slots(plan.tensor_specs))
 
 
 def _emit_core_workspace_stats(
@@ -3111,8 +3245,9 @@ def _map_core_workspace_views(
     """Map caller-owned scratch into the per-spec kernel-arg views (no arena/workspace
     object). With do_init=False this is the vLLM eager-bind primitive: pure
     narrow()+view() at computed offsets, zero allocation, zero init writes."""
-    arena_nbytes = _core_workspace_nbytes(plan)
+    slots = _tensor_arena_slots(plan.tensor_specs)
     offset_bytes = int(offset_bytes)
+    arena_nbytes = _arena_slots_nbytes(slots, offset_bytes=offset_bytes)
     if capacity_nbytes is None:
         capacity_nbytes = shared_arena.numel() - offset_bytes
     if capacity_nbytes < arena_nbytes:
@@ -3121,15 +3256,26 @@ def _map_core_workspace_views(
         )
     relative_offset = 0
     tensors: Dict[str, torch.Tensor] = {}
-    for spec in plan.tensor_specs:
-        tensor, absolute_next = _allocate_arena_tensor(
-            shared_arena,
+    for slot in slots:
+        absolute_offset = align_up(
             offset_bytes + relative_offset,
-            spec,
-            do_init=do_init,
+            slot.alignment,
         )
-        tensors[spec.name] = tensor
-        relative_offset = absolute_next - offset_bytes
+        init_spec = max(
+            slot.specs,
+            key=lambda member: (
+                _tensor_numel(member.shape) * _dtype_nbytes(member.dtype)
+            ),
+        )
+        for spec in slot.specs:
+            tensor, _ = _allocate_arena_tensor(
+                shared_arena,
+                absolute_offset,
+                spec,
+                do_init=do_init and spec is init_spec,
+            )
+            tensors[spec.name] = tensor
+        relative_offset = absolute_offset + slot.nbytes - offset_bytes
     return tensors
 
 
