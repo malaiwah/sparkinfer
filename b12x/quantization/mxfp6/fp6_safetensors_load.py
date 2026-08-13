@@ -47,9 +47,30 @@ def _swizzle_stacked(unswizzled: torch.Tensor) -> torch.Tensor:
 
 
 def _source_format_from_config(quant_config: dict) -> str:
-    """Reconstruct a ``source_format`` selector from a ``quantization_config`` block."""
-    wf = str(quant_config.get("weight_format", "e2m3")).lower()
-    af = str(quant_config.get("activation_format", "e3m2")).lower()
+    """Validate checkpoint identity and return its runtime format selector."""
+    if not isinstance(quant_config, dict):
+        raise TypeError("quantization_config must be a dictionary")
+    required_identity = {
+        "quant_method": "modelopt",
+        "quant_algo": "W6A6",
+        "group_size": 32,
+        "scale_dtype": "uint8_ue8m0",
+    }
+    for key, expected in required_identity.items():
+        if key not in quant_config:
+            raise ValueError(f"quantization_config is missing required {key!r}")
+        if quant_config[key] != expected:
+            raise ValueError(
+                f"quantization_config {key!r} must be {expected!r}, "
+                f"got {quant_config[key]!r}"
+            )
+    for key in ("weight_format", "activation_format"):
+        if key not in quant_config:
+            raise ValueError(f"quantization_config is missing required {key!r}")
+        if not isinstance(quant_config[key], str):
+            raise TypeError(f"quantization_config {key!r} must be a string")
+    wf = quant_config["weight_format"].lower()
+    af = quant_config["activation_format"].lower()
     if wf == "e2m3" and af == "e3m2":
         return "mxfp6_default"
     if wf == "e2m3" and af == "e2m3":
@@ -57,10 +78,68 @@ def _source_format_from_config(quant_config: dict) -> str:
     if wf == "e3m2" and af == "e3m2":
         return "mxfp6_e3m2"
     if wf == "e2m3" and af == "e4m3":
-        # W6A8: unchanged E2M3 weight bytes, FP8 E4M3 runtime activations.
-        # Enabled on an existing E2M3-weight checkpoint by editing config.json.
         return "mxfp6_w6a8"
-    return "mxfp6_default"
+    raise ValueError(
+        "unsupported FP6 quantization format combination: "
+        f"weight_format={wf!r}, activation_format={af!r}"
+    )
+
+
+def _validate_fp6_weight_pair(
+    name: str,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[int, int]:
+    """Validate an encoded linear before swizzle, concatenation, or transfer."""
+    if not isinstance(packed, torch.Tensor) or not isinstance(scale, torch.Tensor):
+        raise TypeError(f"{name} weight and weight_scale must be tensors")
+    if packed.dtype != torch.uint8:
+        raise TypeError(f"{name}.weight must be uint8, got {packed.dtype}")
+    if scale.dtype != torch.uint8:
+        raise TypeError(f"{name}.weight_scale must be uint8, got {scale.dtype}")
+    if packed.ndim != 2 or not packed.is_contiguous():
+        raise ValueError(
+            f"{name}.weight must be contiguous rank 2, got "
+            f"shape={tuple(packed.shape)} stride={tuple(packed.stride())}"
+        )
+    if scale.ndim != 2 or not scale.is_contiguous():
+        raise ValueError(
+            f"{name}.weight_scale must be contiguous rank 2, got "
+            f"shape={tuple(scale.shape)} stride={tuple(scale.stride())}"
+        )
+    rows, packed_k = (int(dim) for dim in packed.shape)
+    if rows <= 0 or packed_k <= 0 or (packed_k * 4) % 3:
+        raise ValueError(
+            f"{name}.weight has invalid packed FP6 shape {tuple(packed.shape)}"
+        )
+    k = packed_k * 4 // 3
+    if k % 32:
+        raise ValueError(f"{name}.weight decodes to K={k}, not divisible by 32")
+    expected_scale = (rows, k // 32)
+    if tuple(scale.shape) != expected_scale:
+        raise ValueError(
+            f"{name}.weight_scale shape {tuple(scale.shape)} does not match "
+            f"packed weight; expected {expected_scale}"
+        )
+    return rows, k
+
+
+def _validate_unit_scalar(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a tensor")
+    if not torch.is_floating_point(tensor) or tensor.numel() != 1:
+        raise ValueError(
+            f"{name} must be one floating-point value, got "
+            f"dtype={tensor.dtype} shape={tuple(tensor.shape)}"
+        )
+    value = tensor.reshape(()).float()
+    if not bool(torch.isfinite(value)) or not bool(
+        torch.allclose(value, torch.ones_like(value), atol=_UNIT_TOL)
+    ):
+        raise NotImplementedError(
+            f"{name} must be finite and unit for the pure-MX W6A6 contract"
+        )
+    return value
 
 
 def load_fp6_moe_weights_from_safetensors(
@@ -84,58 +163,105 @@ def load_fp6_moe_weights_from_safetensors(
     is_gated = activation == "silu"
     weight_fmt = weight_format_for_source(source_format)
 
+    if isinstance(num_experts, bool) or not isinstance(num_experts, int):
+        raise TypeError("num_experts must be a positive integer")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+    encoded: list[
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ] = []
+    expected_geometry: tuple[int, int] | None = None
+
+    for e in range(num_experts):
+        base = f"{prefix}.experts.{e}"
+        gate_name_full = f"{base}.{gate_name}"
+        down_name_full = f"{base}.{down_name}"
+        gate_w = get_tensor(gate_name_full + WEIGHT_SUFFIX)
+        gate_s = get_tensor(gate_name_full + WEIGHT_SCALE_SUFFIX)
+        down_w = get_tensor(down_name_full + WEIGHT_SUFFIX)
+        down_s = get_tensor(down_name_full + WEIGHT_SCALE_SUFFIX)
+        n, k = _validate_fp6_weight_pair(gate_name_full, gate_w, gate_s)
+        down_k, down_n = _validate_fp6_weight_pair(
+            down_name_full, down_w, down_s
+        )
+        if (down_k, down_n) != (k, n):
+            raise ValueError(
+                f"{down_name_full} geometry {(down_k, down_n)} is not the "
+                f"inverse of gate geometry {(n, k)}"
+            )
+        if expected_geometry is None:
+            expected_geometry = (n, k)
+        elif expected_geometry != (n, k):
+            raise ValueError(
+                f"expert {e} geometry {(n, k)} does not match "
+                f"expert 0 geometry {expected_geometry}"
+            )
+        up_w: torch.Tensor | None = None
+        up_s: torch.Tensor | None = None
+        if is_gated:
+            up_name_full = f"{base}.{up_name}"
+            up_w = get_tensor(up_name_full + WEIGHT_SUFFIX)
+            up_s = get_tensor(up_name_full + WEIGHT_SCALE_SUFFIX)
+            if _validate_fp6_weight_pair(up_name_full, up_w, up_s) != (n, k):
+                raise ValueError(
+                    f"{up_name_full} geometry must match gate geometry {(n, k)}"
+                )
+            _validate_unit_scalar(
+                up_name_full + WEIGHT_SCALE_2_SUFFIX,
+                get_tensor(up_name_full + WEIGHT_SCALE_2_SUFFIX),
+            )
+            _validate_unit_scalar(
+                up_name_full + INPUT_SCALE_SUFFIX,
+                get_tensor(up_name_full + INPUT_SCALE_SUFFIX),
+            )
+        _validate_unit_scalar(
+            gate_name_full + WEIGHT_SCALE_2_SUFFIX,
+            get_tensor(gate_name_full + WEIGHT_SCALE_2_SUFFIX),
+        )
+        _validate_unit_scalar(
+            down_name_full + WEIGHT_SCALE_2_SUFFIX,
+            get_tensor(down_name_full + WEIGHT_SCALE_2_SUFFIX),
+        )
+        _validate_unit_scalar(
+            gate_name_full + INPUT_SCALE_SUFFIX,
+            get_tensor(gate_name_full + INPUT_SCALE_SUFFIX),
+        )
+        _validate_unit_scalar(
+            down_name_full + INPUT_SCALE_SUFFIX,
+            get_tensor(down_name_full + INPUT_SCALE_SUFFIX),
+        )
+        encoded.append((gate_w, gate_s, up_w, up_s, down_w, down_s))
+
     w1_codes: list[torch.Tensor] = []
     w2_codes: list[torch.Tensor] = []
     w1_scales: list[torch.Tensor] = []
     w2_scales: list[torch.Tensor] = []
-    w1_gs: list[torch.Tensor] = []
-    w2_gs: list[torch.Tensor] = []
-    a1_is: list[torch.Tensor] = []
-    a2_is: list[torch.Tensor] = []
-
-    for e in range(num_experts):
-        base = f"{prefix}.experts.{e}"
-        gate_w = get_tensor(f"{base}.{gate_name}{WEIGHT_SUFFIX}")  # (N, 3K/4) uint8
-        gate_s = get_tensor(f"{base}.{gate_name}{WEIGHT_SCALE_SUFFIX}")  # (N, K/32)
-        down_w = get_tensor(f"{base}.{down_name}{WEIGHT_SUFFIX}")  # (K, 3N/4)
-        down_s = get_tensor(f"{base}.{down_name}{WEIGHT_SCALE_SUFFIX}")  # (K, N/32)
-        if is_gated:
-            up_w = get_tensor(f"{base}.{up_name}{WEIGHT_SUFFIX}")
-            up_s = get_tensor(f"{base}.{up_name}{WEIGHT_SCALE_SUFFIX}")
-            fc1_w = torch.cat([up_w, gate_w], dim=0)  # [up; gate] (2N, 3K/4)
-            fc1_s = torch.cat([up_s, gate_s], dim=0)  # (2N, K/32) unswizzled
+    for gate_w, gate_s, up_w, up_s, down_w, down_s in encoded:
+        if up_w is not None and up_s is not None:
+            w1_codes.append(torch.cat([up_w, gate_w], dim=0))
+            w1_scales.append(torch.cat([up_s, gate_s], dim=0))
         else:
-            fc1_w = gate_w
-            fc1_s = gate_s
-        w1_codes.append(fc1_w)
+            w1_codes.append(gate_w)
+            w1_scales.append(gate_s)
         w2_codes.append(down_w)
-        w1_scales.append(fc1_s)
         w2_scales.append(down_s)
-        w1_gs.append(get_tensor(f"{base}.{gate_name}{WEIGHT_SCALE_2_SUFFIX}").reshape(()))
-        w2_gs.append(get_tensor(f"{base}.{down_name}{WEIGHT_SCALE_2_SUFFIX}").reshape(()))
-        a1_is.append(get_tensor(f"{base}.{gate_name}{INPUT_SCALE_SUFFIX}").reshape(()))
-        a2_is.append(get_tensor(f"{base}.{down_name}{INPUT_SCALE_SUFFIX}").reshape(()))
 
     dev = torch.device(device)
     w1_fp6 = torch.stack(w1_codes, dim=0).to(dev).contiguous()
     w2_fp6 = torch.stack(w2_codes, dim=0).to(dev).contiguous()
-    w1_blockscale = _swizzle_stacked(torch.stack(w1_scales, dim=0)).to(dev).contiguous()
-    w2_blockscale = _swizzle_stacked(torch.stack(w2_scales, dim=0)).to(dev).contiguous()
-
-    w1_gs_t = torch.stack(w1_gs).float()
-    w2_gs_t = torch.stack(w2_gs).float()
-    a1_is_t = torch.stack(a1_is).float()
-    a2_is_t = torch.stack(a2_is).float()
-    if not (
-        torch.allclose(w1_gs_t, torch.ones_like(w1_gs_t), atol=_UNIT_TOL)
-        and torch.allclose(w2_gs_t, torch.ones_like(w2_gs_t), atol=_UNIT_TOL)
-        and torch.allclose(a1_is_t, torch.ones_like(a1_is_t), atol=_UNIT_TOL)
-        and torch.allclose(a2_is_t, torch.ones_like(a2_is_t), atol=_UNIT_TOL)
-    ):
-        raise NotImplementedError(
-            "Non-unit weight_scale_2/input_scale found; this loader only supports the "
-            "pure-MX W6A6 contract (unit global scales). Per-expert alpha wiring is TODO."
-        )
+    w1_blockscale = (
+        _swizzle_stacked(torch.stack(w1_scales, dim=0)).to(dev).contiguous()
+    )
+    w2_blockscale = (
+        _swizzle_stacked(torch.stack(w2_scales, dim=0)).to(dev).contiguous()
+    )
 
     # Pure-MX contract: per-block UE8M0 carries the range, so dequant alphas and
     # activation global scales are all 1.0 (matches the validated FP6MoEWeights).
@@ -177,7 +303,7 @@ def load_fp6_moe_checkpoint(
     from .model_fp6 import SafetensorsModel, discover_moe_experts
 
     model = SafetensorsModel(model_path)
-    quant_config = model.config.get("quantization_config", {})
+    quant_config = model.config.get("quantization_config")
     source_format = _source_format_from_config(quant_config)
     scheme = discover_moe_experts(model)
     if scheme is None:
@@ -216,16 +342,17 @@ def load_fp6_dense_weight_from_safetensors(
     scale. The result drops straight into :func:`dense_fp6_linear`, whose
     ``alpha = 1/(a_gscale * weight_global_scale)`` is correct for the unit scale.
     """
-    packed = get_tensor(name + WEIGHT_SUFFIX)  # (out, 3*in/4) uint8
-    wscale = get_tensor(name + WEIGHT_SCALE_SUFFIX)  # (out, in/32) uint8, unswizzled
-    wgs = get_tensor(name + WEIGHT_SCALE_2_SUFFIX).reshape(1).float()
-    if not torch.allclose(wgs, torch.ones_like(wgs), atol=_UNIT_TOL):
-        raise NotImplementedError(
-            "Non-unit weight_scale_2 found; the dense FP6 loader only supports the "
-            "pure-MX W6A6 contract (unit weight global scale)."
-        )
-    out_f, packed_in = int(packed.shape[0]), int(packed.shape[1])
-    in_f = packed_in * 4 // 3
+    packed = get_tensor(name + WEIGHT_SUFFIX)
+    wscale = get_tensor(name + WEIGHT_SCALE_SUFFIX)
+    out_f, in_f = _validate_fp6_weight_pair(name, packed, wscale)
+    wgs = _validate_unit_scalar(
+        name + WEIGHT_SCALE_2_SUFFIX,
+        get_tensor(name + WEIGHT_SCALE_2_SUFFIX),
+    ).reshape(1)
+    _validate_unit_scalar(
+        name + INPUT_SCALE_SUFFIX,
+        get_tensor(name + INPUT_SCALE_SUFFIX),
+    )
     fmt = weight_format_for_source(source_format)
     act_fmt = activation_format_for_source(source_format)
     scale_storage = (
@@ -257,7 +384,7 @@ def load_fp6_dense_checkpoint(
     from .model_fp6 import SafetensorsModel
 
     model = SafetensorsModel(model_path)
-    quant_config = model.config.get("quantization_config", {})
+    quant_config = model.config.get("quantization_config")
     source_format = _source_format_from_config(quant_config)
     out: dict[str, FP6DenseWeight] = {}
     for key in model.keys():
