@@ -204,6 +204,91 @@ def cuda_stream_from_int_or_current(stream_int: int | None) -> cuda.CUstream:
     return cuda.CUstream(int(stream_int))
 
 
+def record_tensors_on_current_stream(
+    tensors: list[torch.Tensor | None], device: torch.device
+) -> torch.cuda.Stream:
+    """Record allocator lifetimes on and return the device-qualified Torch stream.
+
+    Keep this trace-visible primitive free of CUDA driver wrapper construction:
+    public composite functions call it before their opaque custom-op boundary,
+    and ``cuda.CUstream`` is not representable in a fullgraph Dynamo graph.
+    Raw launch implementations may convert the returned stream to a driver
+    handle after crossing that boundary.
+    """
+    stream = torch.cuda.current_stream(device)
+    for tensor in tensors:
+        if tensor is not None:
+            tensor.record_stream(stream)
+    return stream
+
+
+def validate_stream_is_current(
+    stream: object | None, device: torch.device
+) -> None:
+    """Validate that ``stream`` is ``None`` or the current stream for ``device``.
+
+    The dense-GEMM path launches raw CuTe kernels alongside PyTorch allocations,
+    zero-fills, Triton reductions, quantizers, and bias epilogues.  Restricting
+    the explicit stream to the current stream ensures all of these stages are
+    ordered by same-stream program order.  Allocator lifetime safety is
+    provided separately by ``record_tensors_on_current_stream`` at every public
+    composite and raw launch boundary, because input/output tensors may have
+    been allocated on a different stream. An explicit stream must be the current
+    stream for the operand device -- anything else is rejected before work.
+
+    Raises ``ValueError`` for wrong-device, non-current, or invalid handles.
+    """
+    if stream is None:
+        return
+    device_index = int(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    current = torch.cuda.current_stream(device)
+    current_handle = int(current.cuda_stream)
+    if isinstance(stream, torch.cuda.Stream):
+        if stream.device.index != device_index:
+            raise ValueError(
+                f"stream is on {stream.device}, but operands are on "
+                f"cuda:{device_index}"
+            )
+        if int(stream.cuda_stream) != current_handle:
+            raise ValueError(
+                f"dense GEMM stream must be the current stream for {device} "
+                f"(handle {current_handle}); got handle "
+                f"{int(stream.cuda_stream)} on {stream.device}"
+            )
+        return
+    stream_int = cuda_stream_to_int(stream)
+    validate_stream_int_is_current(stream_int, device)
+
+
+def validate_stream_int_is_current(
+    stream_int: int | None, device: torch.device
+) -> None:
+    """Validate that a raw stream handle is ``None`` or the current stream.
+
+    Used inside custom ops that receive ``stream_int`` as a scalar.  When
+    ``stream_int`` is ``None`` the launch falls back to the current stream.
+    A non-``None`` handle must be the current stream for ``device`` (handle 0
+    is accepted only when it is the default stream and that is current).
+    """
+    if stream_int is None:
+        return
+    current = torch.cuda.current_stream(device)
+    current_handle = int(current.cuda_stream)
+    if int(stream_int) == current_handle:
+        return
+    # Handle 0 is the default stream; accept it only if it is the current
+    # stream (some devices use a non-zero default-stream handle).
+    if int(stream_int) == 0:
+        default_handle = int(torch.cuda.default_stream(device).cuda_stream)
+        if default_handle == current_handle:
+            return
+    raise ValueError(
+        f"dense GEMM stream must be the current stream for {device} "
+        f"(handle {current_handle}); got handle {int(stream_int)}"
+    )
+
 # Cache for HardwareInfo - it's expensive to create on every call
 _hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
 
