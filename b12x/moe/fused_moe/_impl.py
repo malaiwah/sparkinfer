@@ -931,6 +931,11 @@ class TPMoEScratchPlan:
                 f"top-k {int(topk_ids.shape[1])} does not match TP MoE scratch "
                 f"top-k={int(self.caps.num_topk)}"
             )
+        # Bind-time fast-fail: reject out-of-range expert IDs early. The
+        # authoritative run-time guard lives in b12x_moe_fp4 (which also
+        # handles graph-replay mutation), but this catches malformed caller
+        # tensors before scratch mapping.
+        _validate_expert_ids_bind(topk_ids, int(experts.num_experts))
         scratch_storage = scratch_tensor(scratch, self._scratch_specs, owner="TP MoE")
         # Eager vLLM bind: MAP caller-owned scratch into per-spec kernel-arg views
         # and build the binding directly. NEVER construct a workspace/arena object
@@ -1994,6 +1999,95 @@ def _flatten_routing_weights(topk_weights: torch.Tensor) -> torch.Tensor:
         return flat_weights
 
 
+def _validate_expert_ids_eager(
+    topk_ids: torch.Tensor, weight_E: int
+) -> None:
+    """Eager-only expert-ID range validation.
+
+    Raises ``ValueError`` when any ID falls outside ``[0, weight_E)``.
+    This performs a host-visible synchronization (``.item()``) and must
+    NOT be called during CUDA-graph capture.
+    """
+    if topk_ids.numel() == 0:
+        return
+    min_id = int(topk_ids.min().item())
+    max_id = int(topk_ids.max().item())
+    if min_id < 0 or max_id >= weight_E:
+        raise ValueError(
+            f"topk_ids contain expert IDs outside [0, {weight_E}): "
+            f"min={min_id}, max={max_id}. All active expert IDs must "
+            f"satisfy 0 <= id < {weight_E}."
+        )
+
+
+def _validate_expert_ids_bind(
+    topk_ids: torch.Tensor, weight_E: int
+) -> None:
+    """Bind-time expert-ID validation, safe in any capture state.
+
+    In eager mode this performs the same host-syncing range check as
+    ``_validate_expert_ids_eager``.  During CUDA-graph capture the check
+    is skipped (it would require a forbidden host synchronization) and
+    the authoritative run-time guard in ``b12x_moe_fp4`` handles
+    device-side sanitization instead.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return
+    _validate_expert_ids_eager(topk_ids, weight_E)
+
+
+def _sanitize_expert_ids_capture(
+    flat_ids: torch.Tensor,
+    flat_weights: torch.Tensor,
+    weight_E: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Graph-safe device-side sanitization of expert IDs.
+
+    Clamps out-of-range IDs to 0 and zeros their routing weights so that
+    invalid routes never reach expert-indexed GPU memory operations
+    (histogram atomics, scale/alpha reads, weight TMA).  This is
+    capture-safe — no host synchronization — and replays correctly when
+    the bound ``topk_ids`` buffer is mutated between replays.
+
+    Eager callers should call ``_validate_expert_ids_eager`` first so
+    that invalid IDs are rejected with a clear ``ValueError`` rather
+    than silently sanitized.
+    """
+    with record_function("tp_moe.sanitize_expert_ids"):
+        invalid = (flat_ids < 0) | (flat_ids >= weight_E)
+        safe_ids = torch.where(
+            invalid, torch.zeros_like(flat_ids), flat_ids
+        )
+        safe_weights = torch.where(
+            invalid, torch.zeros_like(flat_weights), flat_weights
+        )
+        return safe_ids, safe_weights
+
+
+def _flatten_and_validate_routing(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    weight_E: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten routing tensors and validate/sanitize expert IDs.
+
+    In eager execution this raises ``ValueError`` for any ID outside
+    ``[0, weight_E)`` before any GPU kernel sees the data.  During
+    CUDA-graph capture (where host synchronization is impossible) it
+    instead sanitizes IDs device-side so replay with mutated buffers
+    remains memory-safe.
+    """
+    flat_ids = _flatten_routing_ids(topk_ids)
+    flat_weights = _flatten_routing_weights(topk_weights)
+    if torch.cuda.is_current_stream_capturing():
+        flat_ids, flat_weights = _sanitize_expert_ids_capture(
+            flat_ids, flat_weights, weight_E
+        )
+    else:
+        _validate_expert_ids_eager(flat_ids, weight_E)
+    return flat_ids, flat_weights
+
+
 def _prepare_expert_scale(scale: torch.Tensor, weight_E: int) -> torch.Tensor:
     with record_function("tp_moe.prepare_expert_scale"):
         if scale.numel() == 1:
@@ -2242,6 +2336,10 @@ def _build_tp_moe_fp4_binding_from_views(
         raise ValueError(
             f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
         )
+    # Bind-time fast-fail for out-of-range expert IDs. The authoritative
+    # run-time guard lives in b12x_moe_fp4 (graph-replay-safe), but this
+    # catches malformed caller tensors before building the binding.
+    _validate_expert_ids_bind(topk_ids, int(experts.num_experts))
 
     source_format = experts.source_format
     quant_mode = _normalize_quant_mode_for_source(
@@ -7747,6 +7845,10 @@ def build_tp_moe_fp4_binding(
         raise ValueError(
             f"routing batch mismatch: expected {a.shape[0]}, got {topk_ids.shape[0]}"
         )
+    # Bind-time fast-fail for out-of-range expert IDs. The authoritative
+    # run-time guard lives in b12x_moe_fp4 (graph-replay-safe), but this
+    # catches malformed caller tensors before building the binding.
+    _validate_expert_ids_bind(topk_ids, int(experts.num_experts))
     source_format = experts.source_format
     workspace_quant_mode = getattr(workspace, "quant_mode", None)
     quant_mode = _select_prepared_quant_mode(
@@ -11018,8 +11120,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
     if impl == "micro":
         assert isinstance(s, TPMicroWorkspace)
-        flat_ids = _flatten_routing_ids(topk_ids)
-        flat_weights = _flatten_routing_weights(topk_weights)
+        flat_ids, flat_weights = _flatten_and_validate_routing(
+            topk_ids, topk_weights, weight_E
+        )
 
         micro_w4a8_trellis = (
             quant_mode == "w4a8_mx"
@@ -11094,8 +11197,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             )
         input_gs = s.input_gs
         down_input_scale = s.down_input_scale
-        flat_ids = _flatten_routing_ids(topk_ids)
-        flat_weights = _flatten_routing_weights(topk_weights)
+        flat_ids, flat_weights = _flatten_and_validate_routing(
+            topk_ids, topk_weights, weight_E
+        )
 
     if output is None:
         if torch.cuda.is_current_stream_capturing():
@@ -11234,7 +11338,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
 
 
 def _validate_sparse_routing(
-    hidden_states: torch.Tensor, routing: B12XTopKRouting
+    hidden_states: torch.Tensor,
+    routing: B12XTopKRouting,
+    num_experts: int | None = None,
 ) -> None:
     if routing.topk_ids.ndim != 2:
         raise ValueError(
@@ -11279,6 +11385,8 @@ def _validate_sparse_routing(
             "flat_weights size mismatch: expected "
             f"{routing.topk_weights.numel()}, got {routing.flat_weights.numel()}"
         )
+    if num_experts is not None:
+        _validate_expert_ids_bind(routing.topk_ids, num_experts)
 
 
 def _alloc_route_workspace(
@@ -11770,7 +11878,7 @@ def b12x_sparse_moe_fp4(
             binding=route_binding,
         )
 
-    _validate_sparse_routing(hidden_states, selected)
+    _validate_sparse_routing(hidden_states, selected, int(experts.num_experts))
 
     moe_binding = build_tp_moe_fp4_binding(
         scratch=workspace,
