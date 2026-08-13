@@ -22,15 +22,21 @@ nothing (the output directory is not even created).
 """
 from __future__ import annotations
 
+from contextlib import suppress
 import json
+import os
 import pathlib
 import re
+import stat
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 import torch
 
 _TILE = 128
+_MAX_OPEN_SHARDS = 256
+_DEFAULT_MAX_METADATA_BYTES = 512 * 1024 * 1024
+_ShardIdentity = tuple[int, int, int, int, int]
 
 # ...layers.{L}.<module>.experts.{E}.<proj>.weight  (one Linear weight per expert)
 _EXPERT_RE = re.compile(
@@ -60,28 +66,312 @@ _FUSED_GATE_UP = ("gate_up_proj", "w13")
 _ATTN_ORDER = ("q_proj", "k_proj", "v_proj", "o_proj")
 
 
-class SafetensorsModel:
-    """Lazy reader for a HF safetensors checkpoint directory."""
+def _validate_shard_name(shard: object) -> str:
+    """Validate and return a single-component ``.safetensors`` shard filename.
 
-    def __init__(self, model_path: str | pathlib.Path):
-        self.path = pathlib.Path(model_path)
-        cfg = self.path / "config.json"
-        self.config: dict = json.loads(cfg.read_text()) if cfg.exists() else {}
-        self.text_config: dict = self.config.get("text_config", self.config)
-        self.weight_map = self._build_weight_map()
-        self._handles: dict[str, object] = {}
+    Rejects non-strings, empty strings, POSIX/Windows path separators (``/``
+    and ``\\``), Windows drive/UNC forms, ``.``/``..``, and any name not
+    ending in ``.safetensors``.  The check is purely lexical and portable so
+    Windows spellings are rejected even when tests run on POSIX.
+    """
+    if not isinstance(shard, str):
+        raise ValueError(
+            f"invalid shard name: expected string, got {type(shard).__name__}"
+        )
+    if not shard:
+        raise ValueError("invalid shard name: empty string")
+    if "/" in shard or "\\" in shard:
+        raise ValueError(f"invalid shard name {shard!r}: contains a path separator")
+    if shard in (".", ".."):
+        raise ValueError(f"invalid shard name {shard!r}")
+    # Reject Windows drive-letter forms (e.g. ``C:foo``, ``1:foo``) even on
+    # POSIX.  ntpath treats any single-character-colon prefix as a drive, so
+    # we reject any ``X:`` where X is one character regardless of type.
+    if len(shard) >= 2 and shard[1] == ":":
+        raise ValueError(f"invalid shard name {shard!r}: Windows drive form")
+    if not shard.endswith(".safetensors"):
+        raise ValueError(f"invalid shard name {shard!r}: must end with .safetensors")
+    return shard
+
+
+def _fd_path(fd: int) -> str:
+    root = "/proc/self/fd" if pathlib.Path("/proc/self/fd").is_dir() else "/dev/fd"
+    return f"{root}/{fd}"
+
+
+def _open_regular_at(dir_fd: int, name: str) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ValueError(f"cannot securely open {name!r}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{name!r} is not a regular file")
+        if info.st_nlink != 1:
+            raise ValueError(
+                f"{name!r} has {info.st_nlink} hard links; exactly one is required"
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+
+
+class SafetensorsModel:
+    """Lazy reader pinned to one immutable model-directory file-descriptor tree.
+
+    Config, index, and shard files are opened relative to retained directory
+    descriptors with ``O_NOFOLLOW``. Shard file descriptors remain open for
+    the model lifetime and safetensors reads them through ``/proc/self/fd`` or
+    ``/dev/fd``. Path replacement, ancestor rename, symlink substitution, and
+    hardlink aliases therefore cannot change the object read after validation.
+    Standard HF snapshot symlinks are accepted only in the exact
+    ``../../blobs/<single-component>`` form and opened through a pinned sibling
+    ``blobs`` directory descriptor.
+    """
+
+    def __init__(
+        self,
+        model_path: str | pathlib.Path,
+        *,
+        max_metadata_bytes: int | None = _DEFAULT_MAX_METADATA_BYTES,
+    ):
+        self.path = pathlib.Path(model_path).resolve()
+        dir_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        self._root_fd = os.open(self.path, dir_flags)
+        self._blobs_fd: int | None = None
+        self._source_fds: dict[_ShardIdentity, int] = {}
+        self._shard_identities: dict[str, _ShardIdentity] = {}
+        self._handles: dict[_ShardIdentity, object] = {}
+        if max_metadata_bytes is not None and max_metadata_bytes <= 0:
+            raise ValueError("max_metadata_bytes must be positive or None")
+        self._max_metadata_bytes = max_metadata_bytes
+        self._metadata_bytes = 0
+        try:
+            if (
+                self.path.parent.name == "snapshots"
+                and self.path.parent.parent.name.startswith("models--")
+            ):
+                snapshots_fd = os.open("..", dir_flags, dir_fd=self._root_fd)
+                try:
+                    repo_fd = os.open("..", dir_flags, dir_fd=snapshots_fd)
+                finally:
+                    os.close(snapshots_fd)
+                try:
+                    self._blobs_fd = os.open("blobs", dir_flags, dir_fd=repo_fd)
+                finally:
+                    os.close(repo_fd)
+            config_text = self._read_model_text("config.json")
+            self.config = json.loads(config_text) if config_text is not None else {}
+            self.text_config: dict = self.config.get("text_config", self.config)
+            self.weight_map: dict[str, str] = self._build_weight_map()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        handles = getattr(self, "_handles", None)
+        if handles is not None:
+            handles.clear()
+        source_fds = getattr(self, "_source_fds", None)
+        if source_fds is not None:
+            for source_fd in source_fds.values():
+                with suppress(OSError):
+                    os.close(source_fd)
+            source_fds.clear()
+        blobs_fd = getattr(self, "_blobs_fd", None)
+        if blobs_fd is not None:
+            with suppress(OSError):
+                os.close(blobs_fd)
+            self._blobs_fd = None
+        root_fd = getattr(self, "_root_fd", -1)
+        if root_fd >= 0:
+            with suppress(OSError):
+                os.close(root_fd)
+            self._root_fd = -1
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _open_model_file_fd(self, name: str) -> int:
+        try:
+            info = os.stat(
+                name,
+                dir_fd=self._root_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"cannot inspect file {name!r} under {self.path}: {exc}"
+            ) from exc
+        if stat.S_ISREG(info.st_mode):
+            return _open_regular_at(self._root_fd, name)
+        if not stat.S_ISLNK(info.st_mode) or self._blobs_fd is None:
+            raise ValueError(f"file {name!r} is not a regular file")
+        target = os.readlink(name, dir_fd=self._root_fd)
+        target_path = pathlib.PurePosixPath(target)
+        parts = target_path.parts
+        if (
+            len(parts) != 4
+            or parts[0] != ".."
+            or parts[1] != ".."
+            or parts[2] != "blobs"
+            or parts[3] in ("", ".", "..")
+            or "/" in parts[3]
+            or "\\" in parts[3]
+        ):
+            raise ValueError(
+                f"file {name!r} has unsupported HF symlink target {target!r}"
+            )
+        return _open_regular_at(self._blobs_fd, parts[3])
+
+    @property
+    def metadata_bytes(self) -> int:
+        return self._metadata_bytes
+
+    def _charge_metadata(self, amount: int, label: str) -> None:
+        if amount < 0:
+            raise ValueError(f"{label} has invalid metadata size")
+        total = self._metadata_bytes + amount
+        if (
+            self._max_metadata_bytes is not None
+            and total > self._max_metadata_bytes
+        ):
+            raise ValueError(
+                f"checkpoint metadata exceeds {self._max_metadata_bytes} "
+                f"bytes while reading {label}"
+            )
+        self._metadata_bytes = total
+
+
+    def _read_model_text(self, name: str) -> str | None:
+        try:
+            fd = self._open_model_file_fd(name)
+        except ValueError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                return None
+            raise
+        try:
+            before = self._shard_identity(fd)
+            self._charge_metadata(8 * before[2] + 4096, name)
+            with os.fdopen(os.dup(fd), "r", encoding="utf-8") as stream:
+                text = stream.read(before[2] + 1)
+            after = self._shard_identity(fd)
+            if before != after or len(text.encode("utf-8")) != before[2]:
+                raise ValueError(f"{name!r} changed while reading")
+            return text
+        finally:
+            os.close(fd)
+
+    def _open_shard_fd(self, shard_name: str) -> int:
+        return self._open_model_file_fd(shard_name)
+
+    @staticmethod
+    def _shard_identity(fd: int) -> _ShardIdentity:
+        info = os.fstat(fd)
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    def _verify_shard_identity(self, identity: _ShardIdentity) -> None:
+        source_fd = self._source_fds[identity]
+        if self._shard_identity(source_fd) != identity:
+            raise ValueError("safetensors shard changed after validation")
+
+    def _handle_shard(self, shard_name: str):
+        from safetensors import safe_open
+
+        cached_identity = self._shard_identities.get(shard_name)
+        if cached_identity is not None:
+            self._verify_shard_identity(cached_identity)
+            return self._handles[cached_identity], cached_identity
+
+        source_fd = self._open_shard_fd(shard_name)
+        try:
+            identity = self._shard_identity(source_fd)
+            handle = self._handles.get(identity)
+            if handle is not None:
+                self._shard_identities[shard_name] = identity
+                return handle, identity
+            if len(self._source_fds) >= _MAX_OPEN_SHARDS:
+                raise ValueError(
+                    f"checkpoint exceeds the {_MAX_OPEN_SHARDS}-shard limit"
+                )
+            header_prefix = os.pread(source_fd, 8, 0)
+            if len(header_prefix) != 8:
+                raise ValueError(f"shard {shard_name!r} has a truncated header")
+            header_bytes = int.from_bytes(header_prefix, "little")
+            if header_bytes > identity[2] - 8:
+                raise ValueError(
+                    f"shard {shard_name!r} has an invalid header size"
+                )
+            self._charge_metadata(
+                4 * (header_bytes + 8) + 4096,
+                shard_name,
+            )
+            handle = safe_open(  # type: ignore[no-untyped-call]
+                _fd_path(source_fd), framework="pt"
+            )
+            if self._shard_identity(source_fd) != identity:
+                raise ValueError(
+                    f"shard {shard_name!r} changed while opening"
+                )
+            self._source_fds[identity] = source_fd
+            source_fd = -1
+            self._shard_identities[shard_name] = identity
+            self._handles[identity] = handle
+            return handle, identity
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
 
     def _build_weight_map(self) -> dict[str, str]:
-        index = self.path / "model.safetensors.index.json"
-        if index.exists():
-            return json.loads(index.read_text())["weight_map"]
-        single = self.path / "model.safetensors"
-        if single.exists():
-            from safetensors import safe_open
+        index_text = self._read_model_text("model.safetensors.index.json")
+        if index_text is not None:
+            raw = json.loads(index_text)
+            weight_map = raw.get("weight_map")
+            if not isinstance(weight_map, dict):
+                raise ValueError(
+                    "model.safetensors.index.json: 'weight_map' is not a JSON object"
+                )
+            return self._validate_weight_map(weight_map)
+        try:
+            handle, _identity = self._handle_shard("model.safetensors")
+        except ValueError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                raise FileNotFoundError(
+                    f"no model.safetensors(.index.json) under {self.path}"
+                ) from exc
+            raise
+        return {key: "model.safetensors" for key in handle.keys()}
 
-            with safe_open(str(single), framework="pt") as f:  # type: ignore[no-untyped-call]
-                return {k: "model.safetensors" for k in f.keys()}
-        raise FileNotFoundError(f"no model.safetensors(.index.json) under {self.path}")
+    def _validate_weight_map(self, raw: dict) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for key, shard in raw.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"invalid weight_map key: expected string, got {type(key).__name__}"
+                )
+            result[key] = _validate_shard_name(shard)
+        return result
 
     def keys(self) -> Iterable[str]:
         return self.weight_map.keys()
@@ -90,20 +380,28 @@ class SafetensorsModel:
         return key in self.weight_map
 
     def _handle(self, key: str):
-        from safetensors import safe_open
-
-        shard = self.weight_map[key]
-        handle = self._handles.get(shard)
-        if handle is None:
-            handle = safe_open(str(self.path / shard), framework="pt")  # type: ignore[no-untyped-call]
-            self._handles[shard] = handle
-        return handle
+        return self._handle_shard(self.weight_map[key])
 
     def get_tensor(self, key: str) -> torch.Tensor:
-        return self._handle(key).get_tensor(key)
+        handle, identity = self._handle(key)
+        self._verify_shard_identity(identity)
+        tensor = handle.get_tensor(key).clone()
+        self._verify_shard_identity(identity)
+        return tensor
 
     def shape_of(self, key: str) -> tuple[int, ...]:
-        return tuple(self._handle(key).get_slice(key).get_shape())
+        handle, identity = self._handle(key)
+        self._verify_shard_identity(identity)
+        shape = tuple(handle.get_slice(key).get_shape())
+        self._verify_shard_identity(identity)
+        return shape
+
+    def dtype_of(self, key: str) -> str:
+        handle, identity = self._handle(key)
+        self._verify_shard_identity(identity)
+        dtype = str(handle.get_slice(key).get_dtype())
+        self._verify_shard_identity(identity)
+        return dtype
 
 
 @dataclass

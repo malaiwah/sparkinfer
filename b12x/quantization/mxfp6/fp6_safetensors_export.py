@@ -19,13 +19,19 @@ its original dtype and recorded in ``quantization_config.exclude_modules``.
 * Dense: MLP (+ optional attention) linears are quantized in place.
 """
 from __future__ import annotations
-
+import ctypes
+import errno
 import json
+import os
 import pathlib
 import re
-import shutil
+import stat
+import sys
+import tempfile
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Optional
+from functools import wraps
+from typing import Callable, Iterator, Optional
 
 import torch
 
@@ -126,6 +132,9 @@ def _error_group(name: str) -> str:
         if f".{tag}." in f".{name}.":
             return f"{tag}.{proj}"
     return proj
+_MAX_AUXILIARY_FILES = 4096
+_MAX_AUXILIARY_FILE_BYTES = 256 * 1024 * 1024
+_MAX_AUXILIARY_TOTAL_BYTES = 512 * 1024 * 1024
 
 
 class _ErrorStats:
@@ -181,6 +190,232 @@ class _ErrorStats:
             )
 
 
+def _fd_path(fd: int) -> str:
+    root = "/proc/self/fd" if pathlib.Path("/proc/self/fd").is_dir() else "/dev/fd"
+    return f"{root}/{fd}"
+
+
+@contextmanager
+def _secure_output_file(
+    directory: pathlib.Path,
+    name: str,
+) -> Iterator[tuple[int, str]]:
+    """Create one pinned output leaf and verify its name still names that inode."""
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        raise ValueError(f"invalid output filename {name!r}")
+    dir_fd = os.open(
+        str(directory),
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+    )
+    fd = -1
+    try:
+        fd = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o666,
+            dir_fd=dir_fd,
+        )
+        opened = os.fstat(fd)
+        yield fd, _fd_path(fd)
+        os.fsync(fd)
+        named = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            named.st_dev,
+            named.st_ino,
+        ) or not stat.S_ISREG(named.st_mode):
+            raise RuntimeError(f"output file {name!r} was replaced during write")
+    except BaseException:
+        if fd >= 0:
+            with suppress(OSError):
+                current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                opened = os.fstat(fd)
+                if (current.st_dev, current.st_ino) == (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    os.unlink(name, dir_fd=dir_fd)
+        raise
+    finally:
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+        os.close(dir_fd)
+
+
+def _secure_write_text(
+    directory: pathlib.Path,
+    name: str,
+    text: str,
+) -> None:
+    with _secure_output_file(directory, name) as (fd, _path):
+        payload = text.encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+
+
+def _remove_tree_fd(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                _remove_tree_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _rename_noreplace(
+    directory_fd: int, source: str, destination: str
+) -> None:
+    """Atomically rename one sibling without replacing any existing entry."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
+        result = libc.renameatx_np(
+            directory_fd,
+            source_bytes,
+            directory_fd,
+            destination_bytes,
+            0x00000004,  # RENAME_EXCL
+        )
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        result = libc.renameat2(
+            directory_fd,
+            source_bytes,
+            directory_fd,
+            destination_bytes,
+            1,  # RENAME_NOREPLACE
+        )
+    else:
+        raise RuntimeError(
+            "atomic no-replace directory publication is unavailable "
+            "on this platform"
+        )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(
+                error,
+                f"refusing to replace existing output directory {destination}",
+                str(destination),
+            )
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+@contextmanager
+def _staged_output_directory(
+    destination: pathlib.Path,
+) -> Iterator[pathlib.Path]:
+    """Yield a pinned private sibling directory, then atomically publish it."""
+    destination = destination.absolute()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    parent = destination.parent.resolve()
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    parent_info = os.fstat(parent_fd)
+    if parent_info.st_mode & 0o022 and not parent_info.st_mode & stat.S_ISVTX:
+        os.close(parent_fd)
+        raise UnsafeAuxiliaryFileError(
+            f"output parent {parent} is group/other writable without sticky bit"
+        )
+    staging_name: str | None = None
+    staging_fd = -1
+    try:
+        staging_name = pathlib.Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.staging-",
+                dir=_fd_path(parent_fd),
+            )
+        ).name
+        staging_fd = os.open(
+            staging_name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        staging = pathlib.Path(_fd_path(staging_fd))
+        yield staging
+        os.fsync(staging_fd)
+        os.fchmod(staging_fd, 0o755)
+        pinned = os.fstat(staging_fd)
+        named = os.stat(
+            staging_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (pinned.st_dev, pinned.st_ino) != (named.st_dev, named.st_ino):
+            raise RuntimeError("staged output directory was replaced")
+        _rename_noreplace(
+            parent_fd,
+            staging_name,
+            destination.name,
+        )
+        published = os.stat(
+            destination.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (pinned.st_dev, pinned.st_ino) != (
+            published.st_dev,
+            published.st_ino,
+        ):
+            raise RuntimeError("published output directory identity changed")
+        os.fsync(parent_fd)
+        staging_name = None
+    except BaseException:
+        if staging_name is not None:
+            if staging_fd < 0:
+                with suppress(OSError):
+                    staging_fd = os.open(
+                        staging_name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=parent_fd,
+                    )
+            if staging_fd >= 0:
+                with suppress(OSError):
+                    _remove_tree_fd(staging_fd)
+                with suppress(OSError):
+                    os.rmdir(staging_name, dir_fd=parent_fd)
+        raise
+    finally:
+        if staging_fd >= 0:
+            os.close(staging_fd)
+        os.close(parent_fd)
+
+
+def _transactional_output(function: Callable):
+    @wraps(function)
+    def wrapped(model_path, out_dir, *args, **kwargs):
+        if kwargs.get("dry_run") is True:
+            return function(model_path, out_dir, *args, **kwargs)
+        destination = pathlib.Path(out_dir)
+        with _staged_output_directory(destination) as staging:
+            report = function(model_path, staging, *args, **kwargs)
+        report.out_dir = str(destination)
+        return report
+
+    return wrapped
+
+
 class _ShardWriter:
     """Stream tensors to size-capped safetensors shards, then finalize the index."""
 
@@ -193,6 +428,7 @@ class _ShardWriter:
         self._buf: dict[str, torch.Tensor] = {}
         self._buf_bytes = 0
         self._shard_keys: list[list[str]] = []  # provisional shard idx -> keys
+        self._shard_ids: dict[str, tuple[int, int]] = {}
         self.weight_map: dict[str, str] = {}
         self.total_bytes = 0
 
@@ -214,7 +450,10 @@ class _ShardWriter:
             return
         idx = len(self._shard_keys)
         name = f"model-{idx:05d}.safetensors"
-        self._save_file(self._buf, str(self.out_dir / name), metadata={"format": "pt"})
+        with _secure_output_file(self.out_dir, name) as (fd, path):
+            self._save_file(self._buf, path, metadata={"format": "pt"})
+            info = os.fstat(fd)
+            self._shard_ids[name] = (info.st_dev, info.st_ino)
         self._shard_keys.append(list(self._buf.keys()))
         self._buf = {}
         self._buf_bytes = 0
@@ -223,39 +462,287 @@ class _ShardWriter:
         """Flush, rename shards to HF ``-of-N`` form, write the index. Returns shard count."""
         self._flush()
         n = len(self._shard_keys)
-        for idx, keys in enumerate(self._shard_keys):
-            old = self.out_dir / f"model-{idx:05d}.safetensors"
-            final = (
-                "model.safetensors"
-                if n == 1
-                else f"model-{idx + 1:05d}-of-{n:05d}.safetensors"
-            )
-            (self.out_dir / final).unlink(missing_ok=True)
-            old.rename(self.out_dir / final)
-            for key in keys:
-                self.weight_map[key] = final
+        dir_fd = os.open(
+            self.out_dir,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            for idx, keys in enumerate(self._shard_keys):
+                old = f"model-{idx:05d}.safetensors"
+                current = os.stat(
+                    old, dir_fd=dir_fd, follow_symlinks=False
+                )
+                if (current.st_dev, current.st_ino) != self._shard_ids[old]:
+                    raise RuntimeError(
+                        f"staged shard {old!r} was replaced before finalize"
+                    )
+                final = (
+                    "model.safetensors"
+                    if n == 1
+                    else f"model-{idx + 1:05d}-of-{n:05d}.safetensors"
+                )
+                os.link(
+                    old,
+                    final,
+                    src_dir_fd=dir_fd,
+                    dst_dir_fd=dir_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(old, dir_fd=dir_fd)
+                for key in keys:
+                    self.weight_map[key] = final
+        finally:
+            os.close(dir_fd)
         index = {
             "metadata": {"total_size": self.total_bytes},
             "weight_map": self.weight_map,
         }
-        (self.out_dir / "model.safetensors.index.json").write_text(
-            json.dumps(index, indent=2)
+        _secure_write_text(
+            self.out_dir,
+            "model.safetensors.index.json",
+            json.dumps(index, indent=2),
         )
         return n
 
 
-def _copy_aux_files(src: pathlib.Path, dst: pathlib.Path) -> None:
-    """Copy tokenizer / generation / misc files so the output dir is fully loadable."""
+class UnsafeAuxiliaryFileError(RuntimeError):
+    """Raised when an eligible auxiliary source entry is identified as unsafe.
+
+    The FP6 exporters must never follow attacker-authored symlinks or copy
+    special file types: doing so would embed arbitrary victim-readable bytes
+    into the output bundle.  Every *eligible* auxiliary candidate (any
+    top-level entry that is not ``*.safetensors``, ``config.json``, or a
+    shard index) that is a symlink or non-regular file fails closed — it is
+    never copied.  This exception is raised when the unsafe kind can be
+    identified through the no-follow open + ``fstat`` path (symlinks detected
+    via ``O_NOFOLLOW``/``ELOOP``, or special files identified by ``fstat``
+    after a successful open).  When the underlying ``os.open`` itself rejects
+    the entry (e.g. ``ENXIO`` for a device node), the original ``OSError`` is
+    allowed to propagate.  Entries that are intentionally skipped — model
+    weights, the generated ``config.json``, and shard index files — are never
+    inspected and therefore never trigger this error.  Standard Hugging Face
+    cache snapshot links are deliberately rejected; see
+    :func:`_copy_aux_files` for guidance.
+    """
+
+
+def _copy_aux_files(src: pathlib.Path | int, dst: pathlib.Path) -> None:
+    """Copy tokenizer / generation / misc files so the output dir is fully loadable.
+
+    Security contract: only ordinary regular files from ``src`` are copied.
+    Every *eligible* auxiliary candidate (i.e. any top-level entry that is
+    not ``*.safetensors``, ``config.json``, or a shard index) that is a
+    symlink or non-regular file fails closed — it is never copied.  When the
+    unsafe kind can be identified through the no-follow open + ``fstat``
+    path, :class:`UnsafeAuxiliaryFileError` is raised with a descriptive
+    message; when the underlying ``os.open`` itself rejects the entry (e.g.
+    ``ENXIO`` for a device node), the original ``OSError`` propagates.  In
+    either case no bytes from the entry enter the output bundle.  Skipped
+    names (model weights, generated config, shard indices) are never
+    inspected and cannot trigger this error.
+
+    Race resistance: the source root is opened with ``O_DIRECTORY | O_NOFOLLOW``
+    (rejecting a symlinked root), and each candidate is opened with
+    ``O_NOFOLLOW | O_NONBLOCK`` relative to the source-directory descriptor,
+    then ``fstat``-ed and required to be a regular file before copying.  There
+    is no separate ``lstat`` before the open, so a swap to a symlink between
+    validation and open is rejected atomically by the kernel rather than
+    followed.
+
+    Capabilities: this function requires ``O_NOFOLLOW``, ``O_DIRECTORY``,
+    ``O_NONBLOCK``, fd-relative ``os.open`` (``dir_fd`` — verified via
+    ``os.supports_dir_fd``), and fd-based ``os.listdir`` (verified via
+    ``os.supports_fd``).  If any are unavailable the function fails closed
+    rather than silently degrading to symlink-following behavior.
+
+    Hugging Face cache snapshot inputs present files as client-generated
+    symlinks to content-addressed blobs outside the snapshot directory.  These
+    are rejected here by design.  Operators who trust the HF client's own
+    cache links should materialize the snapshot as real files through the
+    HF client's vetted download path (e.g. ``huggingface_hub`` ``local_dir``
+    mode, which writes real files, not symlinks) before export.  **Never**
+    dereference symlinks from an untrusted or attacker-authored checkout —
+    copy only real files.
+    """
+    _require_aux_capabilities()
     skip_suffixes = (".safetensors",)
     skip_names = {"model.safetensors.index.json", "config.json"}
-    for item in src.iterdir():
-        if not item.is_file():
-            continue
-        if item.name in skip_names or item.suffix in skip_suffixes:
-            continue
-        if item.name.endswith(".safetensors.index.json"):
-            continue
-        shutil.copy2(item, dst / item.name)
+    dst = pathlib.Path(dst)
+    if isinstance(src, int):
+        src_fd = os.dup(src)
+        src_label = f"pinned model fd {src}"
+    else:
+        src_path = pathlib.Path(src)
+        src_label = str(src_path)
+        src_fd = os.open(
+            str(src_path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    copied_files = 0
+    copied_bytes = 0
+    try:
+        with os.scandir(src_fd) as entries:
+            for dir_entry in entries:
+                entry = dir_entry.name
+                if entry in skip_names:
+                    continue
+                if entry.endswith(".safetensors.index.json"):
+                    continue
+                copied = _copy_one_aux(
+                    src_fd,
+                    src_label,
+                    entry,
+                    skip_suffixes,
+                    dst,
+                    max_bytes=_MAX_AUXILIARY_TOTAL_BYTES - copied_bytes,
+                )
+                if copied is None:
+                    continue
+                copied_files += 1
+                copied_bytes += copied
+                if copied_files > _MAX_AUXILIARY_FILES:
+                    raise UnsafeAuxiliaryFileError(
+                        "auxiliary file count exceeds "
+                        f"{_MAX_AUXILIARY_FILES}"
+                    )
+                if copied_bytes > _MAX_AUXILIARY_TOTAL_BYTES:
+                    raise UnsafeAuxiliaryFileError(
+                        "auxiliary data exceeds "
+                        f"{_MAX_AUXILIARY_TOTAL_BYTES} bytes"
+                    )
+    finally:
+        os.close(src_fd)
+
+
+# Module-local seam for the candidate open.  Tests monkeypatch this to
+# simulate races (swap-to-symlink, file-vanishes) without disturbing the
+# real os.open used by the capability check and the source-root open.
+_candidate_open = os.open
+
+
+_AUX_CAPABILITIES: tuple[str, ...] = (
+    "O_NOFOLLOW",
+    "O_DIRECTORY",
+    "O_NONBLOCK",
+)
+
+
+def _require_aux_capabilities() -> None:
+    """Fail closed unless fd-relative, no-follow copying is supported."""
+    missing_flags = [name for name in _AUX_CAPABILITIES if not hasattr(os, name)]
+    if missing_flags:
+        raise UnsafeAuxiliaryFileError(
+            f"cannot safely copy auxiliary files: missing OS flags {missing_flags}"
+        )
+    if os.open not in os.supports_dir_fd:
+        raise UnsafeAuxiliaryFileError(
+            "cannot safely copy auxiliary files: "
+            "os.open does not support dir_fd on this platform"
+        )
+    if os.scandir not in os.supports_fd:
+        raise UnsafeAuxiliaryFileError(
+            "cannot safely copy auxiliary files: fd-based directory "
+            "listing (os.scandir/listdir) is unsupported on this platform"
+        )
+
+
+def _copy_one_aux(
+    src_fd: int,
+    src_dir: str,
+    name: str,
+    skip_suffixes: tuple[str, ...],
+    dst: pathlib.Path,
+    *,
+    max_bytes: int = _MAX_AUXILIARY_TOTAL_BYTES,
+) -> int | None:
+    """Copy one pinned, unique-link regular source into an exclusive output."""
+    if name.endswith(skip_suffixes):
+        return
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = _candidate_open(name, flags, dir_fd=src_fd)
+    except OSError as exc:
+        if exc.errno in (
+            errno.ELOOP,
+            getattr(errno, "EFTYPE", errno.ELOOP),
+        ):
+            raise UnsafeAuxiliaryFileError(
+                f"refusing to follow auxiliary symlink {src_dir!r}/{name!r}; "
+                "only real regular files are copied"
+            ) from exc
+        raise
+    try:
+        source_before = os.fstat(fd)
+        if stat.S_ISDIR(source_before.st_mode):
+            return
+        if not stat.S_ISREG(source_before.st_mode):
+            kind = _unsafe_kind(source_before.st_mode)
+            raise UnsafeAuxiliaryFileError(
+                f"refusing to copy {kind} {src_dir!r}/{name!r}; "
+                "only real regular files are copied"
+            )
+        if source_before.st_nlink != 1:
+            raise UnsafeAuxiliaryFileError(
+                f"refusing to copy hard-linked file {src_dir!r}/{name!r}"
+            )
+        allowed_bytes = min(_MAX_AUXILIARY_FILE_BYTES, max_bytes)
+        if source_before.st_size > allowed_bytes:
+            raise UnsafeAuxiliaryFileError(
+                f"auxiliary file {src_dir!r}/{name!r} exceeds "
+                f"remaining limit of {allowed_bytes} bytes"
+            )
+        remaining = source_before.st_size
+        with _secure_output_file(dst, name) as (dst_fd, _path):
+            while remaining:
+                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise UnsafeAuxiliaryFileError(
+                        f"auxiliary file {src_dir!r}/{name!r} was truncated"
+                    )
+                offset = 0
+                while offset < len(chunk):
+                    offset += os.write(dst_fd, chunk[offset:])
+                remaining -= len(chunk)
+            if os.read(fd, 1):
+                raise UnsafeAuxiliaryFileError(
+                    f"auxiliary file {src_dir!r}/{name!r} grew during copy"
+                )
+            source_after = os.fstat(fd)
+            if (
+                source_before.st_dev,
+                source_before.st_ino,
+                source_before.st_size,
+                source_before.st_mtime_ns,
+                source_before.st_ctime_ns,
+            ) != (
+                source_after.st_dev,
+                source_after.st_ino,
+                source_after.st_size,
+                source_after.st_mtime_ns,
+                source_after.st_ctime_ns,
+            ):
+                raise UnsafeAuxiliaryFileError(
+                    f"auxiliary file {src_dir!r}/{name!r} changed during copy"
+                )
+        return source_before.st_size
+    finally:
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+
+
+def _unsafe_kind(mode: int) -> str:
+    """Return a human-readable name for a non-regular, non-directory mode."""
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character device"
+    if stat.S_ISBLK(mode):
+        return "block device"
+    return "non-regular file"
 
 
 def _write_config(
@@ -263,7 +750,7 @@ def _write_config(
 ) -> None:
     cfg = dict(src_config)
     cfg["quantization_config"] = quant_config
-    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+    _secure_write_text(out_dir, "config.json", json.dumps(cfg, indent=2))
 
 
 def _emit_quantized_linear(
@@ -329,6 +816,7 @@ def _emit_quantized_linear(
     return True
 
 
+@_transactional_output
 def export_moe_model_to_fp6_safetensors(
     model_path: str | pathlib.Path,
     out_dir: str | pathlib.Path,
@@ -510,7 +998,7 @@ def export_moe_model_to_fp6_safetensors(
         block_scale_rule=block_scale_rule,
     )
     _write_config(model.config, out, quant_config)
-    _copy_aux_files(pathlib.Path(model_path), out)
+    _copy_aux_files(model._root_fd, out)
     if error_stats is not None:
         report.error_groups = error_stats.summary()
         if verbose:
@@ -581,6 +1069,7 @@ def _layer_expert_matrices(
     return gate, up, down
 
 
+@_transactional_output
 def export_dense_model_to_fp6_safetensors(
     model_path: str | pathlib.Path,
     out_dir: str | pathlib.Path,
@@ -693,7 +1182,7 @@ def export_dense_model_to_fp6_safetensors(
         block_scale_rule=block_scale_rule,
     )
     _write_config(model.config, out, quant_config)
-    _copy_aux_files(pathlib.Path(model_path), out)
+    _copy_aux_files(model._root_fd, out)
     if error_stats is not None:
         report.error_groups = error_stats.summary()
         if verbose:
@@ -706,6 +1195,7 @@ def export_dense_model_to_fp6_safetensors(
     return report
 
 
+@_transactional_output
 def dequantize_fp6_checkpoint_to_bf16(
     model_path: str | pathlib.Path,
     out_dir: str | pathlib.Path,
@@ -779,8 +1269,8 @@ def dequantize_fp6_checkpoint_to_bf16(
     report.total_bytes = writer.total_bytes
     cfg = dict(model.config)
     cfg.pop("quantization_config", None)
-    (out / "config.json").write_text(json.dumps(cfg, indent=2))
-    _copy_aux_files(pathlib.Path(model_path), out)
+    _secure_write_text(out, "config.json", json.dumps(cfg, indent=2))
+    _copy_aux_files(model._root_fd, out)
     if verbose:
         print(
             f"[fp6-dequant] done: dequantized={report.quantized_tensors} "
