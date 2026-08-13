@@ -11,6 +11,7 @@ from torch.profiler import record_function
 from .planner import (
     PagedPlan,
     PagedPlanBudget,
+    _validate_active_page_ids,
     create_paged_plan,
     infer_paged_mode,
     plan_decode_graph_capacity,
@@ -145,6 +146,7 @@ class PagedAttentionWorkspaceContract:
     head_dim_qk: int
     head_dim_vo: int
     num_cache_pages: int
+    num_v_cache_pages: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_total_q", max(int(self.max_total_q), 1))
@@ -161,6 +163,12 @@ class PagedAttentionWorkspaceContract:
         object.__setattr__(self, "head_dim_qk", max(int(self.head_dim_qk), 1))
         object.__setattr__(self, "head_dim_vo", max(int(self.head_dim_vo), 1))
         object.__setattr__(self, "num_cache_pages", max(int(self.num_cache_pages), 1))
+        if int(self.num_v_cache_pages) <= 0:
+            object.__setattr__(self, "num_v_cache_pages", int(self.num_cache_pages))
+        else:
+            object.__setattr__(
+                self, "num_v_cache_pages", max(int(self.num_v_cache_pages), 1)
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -411,6 +419,8 @@ class PagedAttentionArena:
             head_dim_qk=contract.head_dim_qk,
             head_dim_vo=contract.head_dim_vo,
             page_size=self.caps.page_size,
+            num_cache_pages=contract.num_cache_pages,
+            num_v_cache_pages=contract.num_v_cache_pages,
             use_cuda_graph=use_cuda_graph,
             fixed_capacity=True,
             _plan_q=plan_q,
@@ -460,6 +470,8 @@ class PagedAttentionWorkspace:
     head_dim_qk: int
     head_dim_vo: int
     page_size: int = 64
+    num_cache_pages: int = 0
+    num_v_cache_pages: int = 0
     use_cuda_graph: bool = False
     fixed_capacity: bool = False
     request_indices: torch.Tensor | None = None
@@ -533,6 +545,7 @@ class PagedAttentionWorkspace:
         page_size: int,
         max_total_q: int,
         num_cache_pages: int,
+        num_v_cache_pages: int = 0,
         use_cuda_graph: bool = False,
     ) -> PagedAttentionWorkspace:
         device = _canonical_device(device)
@@ -556,7 +569,12 @@ class PagedAttentionWorkspace:
             device=device,
         )
         plan_v_cache = _shape_only_cuda_tensor(
-            (num_cache_pages, page_size, num_kv_heads, head_dim_vo),
+            (
+                num_v_cache_pages if num_v_cache_pages > 0 else num_cache_pages,
+                page_size,
+                num_kv_heads,
+                head_dim_vo,
+            ),
             dtype=kv_dtype,
             device=device,
         )
@@ -570,6 +588,10 @@ class PagedAttentionWorkspace:
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             page_size=page_size,
+            num_cache_pages=num_cache_pages,
+            num_v_cache_pages=(
+                num_v_cache_pages if num_v_cache_pages > 0 else num_cache_pages
+            ),
             use_cuda_graph=use_cuda_graph,
             _plan_q=plan_q,
             _plan_output=plan_output,
@@ -596,6 +618,7 @@ class PagedAttentionWorkspace:
         max_work_items: int,
         max_partial_rows: int,
         num_cache_pages: int,
+        num_v_cache_pages: int = 0,
         use_cuda_graph: bool = False,
     ) -> PagedAttentionWorkspace:
         device = _canonical_device(device)
@@ -627,6 +650,7 @@ class PagedAttentionWorkspace:
             head_dim_qk=head_dim_qk,
             head_dim_vo=head_dim_vo,
             num_cache_pages=num_cache_pages,
+            num_v_cache_pages=num_v_cache_pages,
         )
         return arena.make_workspace(contract, use_cuda_graph=use_cuda_graph)
 
@@ -647,6 +671,7 @@ class PagedAttentionWorkspace:
         max_batch: int,
         max_page_table_width: int,
         num_cache_pages: int,
+        num_v_cache_pages: int = 0,
         use_cuda_graph: bool = False,
     ) -> PagedAttentionWorkspace:
         return cls.for_fixed_capacity(
@@ -669,6 +694,7 @@ class PagedAttentionWorkspace:
             ),
             max_partial_rows=0,
             num_cache_pages=num_cache_pages,
+            num_v_cache_pages=num_v_cache_pages,
             use_cuda_graph=use_cuda_graph,
         )
 
@@ -700,6 +726,7 @@ class PagedAttentionWorkspace:
             page_size=int(k_cache.shape[1]),
             max_total_q=int(q.shape[0]),
             num_cache_pages=int(k_cache.shape[0]),
+            num_v_cache_pages=int(v_cache.shape[0]),
             use_cuda_graph=use_cuda_graph,
         )
 
@@ -730,6 +757,29 @@ class PagedAttentionWorkspace:
     @property
     def planner_budget(self) -> PagedPlanBudget | None:
         return self._planner_budget
+
+    @property
+    def _max_valid_page_id(self) -> int:
+        """Physical page capacity bound: min(K pages, V pages)."""
+        k_pages = int(self._plan_k_cache.shape[0]) if self._plan_k_cache is not None else int(self.num_cache_pages)
+        v_pages = int(self._plan_v_cache.shape[0]) if self._plan_v_cache is not None else int(self.num_v_cache_pages)
+        return min(k_pages, v_pages)
+
+    def _validate_page_ids(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> None:
+        """Eagerly reject active page IDs outside [0, min(k_pages, v_pages)).
+
+        Must be called outside CUDA graph capture (issues a host sync).
+        """
+        _validate_active_page_ids(
+            page_table,
+            cache_seqlens,
+            int(self.page_size),
+            self._max_valid_page_id,
+        )
 
     @staticmethod
     def _plan_has_regular_decode_graph_grid(plan: PagedPlan) -> bool:
@@ -813,6 +863,7 @@ class PagedAttentionWorkspace:
                         f"decode graph replay workspace was prepared with window_left={self._plan.window_left}, "
                         f"got window_left={int(window_left)}"
                     )
+                self._validate_page_ids(page_table, cache_seqlens)
                 with record_function("paged_workspace.copy_runtime_metadata"):
                     self._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 with record_function(

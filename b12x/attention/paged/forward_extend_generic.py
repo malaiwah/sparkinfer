@@ -3540,9 +3540,9 @@ class PagedForwardKernel:
             row_valid = row_idx < valid_rows
             row_byte_base = (
                 (
-                    Int64(Uint32(page_id)) * Int64(page_stride_bytes)
-                    + Int64(Uint32(entry_idx)) * Int64(token_stride_bytes)
-                    + Int64(Uint32(kv_head_idx)) * Int64(head_stride_bytes)
+                    Int64(page_id) * Int64(page_stride_bytes)
+                    + Int64(entry_idx) * Int64(token_stride_bytes)
+                    + Int64(kv_head_idx) * Int64(head_stride_bytes)
                 )
                 if const_expr(self.use_kv_repack)
                 else (

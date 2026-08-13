@@ -88,6 +88,51 @@ def _align_up(x: int, y: int) -> int:
     return _ceil_div(x, y) * y
 
 
+def _validate_active_page_ids(
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_size: int,
+    max_valid_page_id: int,
+) -> None:
+    """Reject active page IDs outside ``[0, max_valid_page_id)``.
+
+    Active entries are ``page_table[i, j]`` for
+    ``j < ceil(cache_seqlens[i] / page_size)``.  Padded tail entries
+    beyond the active prefix are not inspected, so their values are
+    irrelevant.
+
+    Validation is eager and issues a host sync; callers must ensure it
+    is not invoked inside CUDA graph capture.
+    """
+    if max_valid_page_id <= 0:
+        raise ValueError(
+            f"max_valid_page_id must be positive, got {max_valid_page_id}"
+        )
+    batch = int(page_table.shape[0])
+    width = int(page_table.shape[1])
+    if batch == 0 or width == 0:
+        return
+    seqlens_i32 = cache_seqlens.to(torch.int32)
+    page_size_t = torch.tensor(
+        page_size, dtype=torch.int32, device=page_table.device
+    )
+    cache_pages = (seqlens_i32 + page_size_t - 1) // page_size_t
+    col_idx = torch.arange(width, dtype=torch.int32, device=page_table.device)
+    active_mask = col_idx.unsqueeze(0) < cache_pages.unsqueeze(1)
+    active_ids = page_table[active_mask]
+    if active_ids.numel() == 0:
+        return
+    # Widen to int64 so high recycled page IDs do not overflow in min/max.
+    active_ids_long = active_ids.to(torch.long)
+    min_id = int(active_ids_long.min().item())
+    max_id = int(active_ids_long.max().item())
+    if min_id < 0 or max_id >= max_valid_page_id:
+        raise ValueError(
+            f"active page IDs must be in [0, {max_valid_page_id}), "
+            f"got range [{min_id}, {max_id}]"
+        )
+
+
 def _msa_decode_chunk_tokens(policy_batch: int) -> int:
     if int(policy_batch) <= 2:
         return 128
@@ -1798,6 +1843,15 @@ def create_paged_plan(
     cache_pages_arr = [_ceil_div(cache_len, page_size) for cache_len in cache_lengths]
     if any(cache_pages > max_pages_per_request for cache_pages in cache_pages_arr):
         raise ValueError("page_table width is smaller than required by cache_seqlens")
+
+    # Bind independent physical K and V page capacities and reject active
+    # page IDs outside [0, min(k_pages, v_pages)) before any TMA/cp.async/raw
+    # address use.  Padded tail entries beyond the active prefix are not
+    # inspected.
+    _max_valid_page_id = min(num_pages, v_num_pages)
+    _validate_active_page_ids(
+        page_table, cache_seqlens, page_size, _max_valid_page_id
+    )
 
     inferred_mode = infer_paged_mode(cu_seqlens_q)
     mode = inferred_mode if mode is None else mode

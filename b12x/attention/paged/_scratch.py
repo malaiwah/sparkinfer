@@ -21,6 +21,7 @@ from torch.profiler import record_function
 from b12x.attention.paged.planner import (
     PagedPlan,
     PagedPlanBudget,
+    _validate_active_page_ids,
     create_paged_plan,
     infer_paged_mode,
     plan_decode_graph_capacity,
@@ -109,6 +110,7 @@ class B12XPagedAttentionScratchCaps:
     max_work_items: int
     max_partial_rows: int
     num_cache_pages: int
+    num_v_cache_pages: int = 0
     use_cuda_graph: bool = False
     copy_runtime_metadata: bool = True
     msa_block_sparse: bool = False
@@ -153,6 +155,12 @@ class B12XPagedAttentionScratchCaps:
         object.__setattr__(self, "max_work_items", max(int(self.max_work_items), 0))
         object.__setattr__(self, "max_partial_rows", max(int(self.max_partial_rows), 0))
         object.__setattr__(self, "num_cache_pages", max(int(self.num_cache_pages), 1))
+        if int(self.num_v_cache_pages) <= 0:
+            object.__setattr__(self, "num_v_cache_pages", int(self.num_cache_pages))
+        else:
+            object.__setattr__(
+                self, "num_v_cache_pages", max(int(self.num_v_cache_pages), 1)
+            )
         object.__setattr__(self, "use_cuda_graph", bool(self.use_cuda_graph))
         object.__setattr__(
             self, "copy_runtime_metadata", bool(self.copy_runtime_metadata)
@@ -449,6 +457,7 @@ class B12XPagedAttentionScratch:
     max_work_items: int
     max_partial_rows: int
     num_cache_pages: int
+    num_v_cache_pages: int = 0
     use_cuda_graph: bool = False
     copy_runtime_metadata: bool = True
     fixed_capacity: bool = True
@@ -527,6 +536,27 @@ class B12XPagedAttentionScratch:
     @property
     def planner_budget(self) -> PagedPlanBudget | None:
         return self._planner_budget
+
+    @property
+    def _max_valid_page_id(self) -> int:
+        """Physical page capacity bound: min(K pages, V pages)."""
+        return min(int(self.num_cache_pages), int(self.num_v_cache_pages))
+
+    def _validate_page_ids(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> None:
+        """Eagerly reject active page IDs outside [0, min(k_pages, v_pages)).
+
+        Must be called outside CUDA graph capture (issues a host sync).
+        """
+        _validate_active_page_ids(
+            page_table,
+            cache_seqlens,
+            int(self.page_size),
+            self._max_valid_page_id,
+        )
 
     def current_lse_view(self) -> torch.Tensor:
         if self.lse is None:
@@ -645,6 +675,7 @@ class B12XPagedAttentionScratch:
                         f"prepared capacity 1..{int(self._plan.total_q)}, got "
                         f"{int(active_total_q)}"
                     )
+                self._validate_page_ids(page_table, cache_seqlens)
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 self._copy_cached_plan_metadata(self._plan_metadata_cache)
                 self._update_prefill_graph_replay_metadata_from_runtime()
@@ -682,6 +713,7 @@ class B12XPagedAttentionScratch:
                         f"window_left={self._plan.window_left}, got "
                         f"window_left={int(window_left)}"
                     )
+                self._validate_page_ids(page_table, cache_seqlens)
                 self._bind_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
                 if self._plan_metadata_cache is None:
                     raise RuntimeError(
@@ -1816,6 +1848,7 @@ def _materialize_paged_attention_scratch(
         max_work_items=caps.max_work_items,
         max_partial_rows=caps.max_partial_rows,
         num_cache_pages=caps.num_cache_pages,
+        num_v_cache_pages=caps.num_v_cache_pages,
         use_cuda_graph=caps.use_cuda_graph,
         copy_runtime_metadata=caps.copy_runtime_metadata,
         request_indices=request_indices,

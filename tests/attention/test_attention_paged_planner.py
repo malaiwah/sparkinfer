@@ -1462,3 +1462,215 @@ def test_paged_non_policy_chunk_selection_still_produces_valid_plans(
     assert plan.new_batch_size >= page_table.shape[0]
     assert plan.total_num_partial_rows == 0
     assert plan.split_kv is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #156: page-ID bound validation tests
+# ---------------------------------------------------------------------------
+
+
+def _make_validation_inputs(
+    *,
+    page_ids: list[list[int]],
+    cache_seqlens: list[int],
+    num_pages: int,
+    page_size: int = 64,
+    q_heads: int = 8,
+    kv_heads: int = 1,
+    head_dim: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build minimal CUDA inputs with explicit page IDs for validation tests."""
+    device = "cuda"
+    batch = len(page_ids)
+    total_q = batch  # decode: one query per request
+    max_pages = max(len(ids) for ids in page_ids)
+    q = torch.randn(total_q, q_heads, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        num_pages, page_size, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn(
+        num_pages, page_size, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    page_table = torch.zeros(batch, max_pages, dtype=torch.int32, device=device)
+    for i, ids in enumerate(page_ids):
+        page_table[i, : len(ids)] = torch.tensor(ids, dtype=torch.int32, device=device)
+        # Pad tail with the last valid id (mirrors production page-table padding).
+        if ids:
+            page_table[i, len(ids) :] = ids[-1]
+    cache_seqlens_t = torch.tensor(cache_seqlens, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+    return q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q
+
+
+def test_paged_plan_rejects_negative_page_id() -> None:
+    """A negative active page ID must fail before any address use."""
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_validation_inputs(
+            page_ids=[[0, -1, 2]],
+            cache_seqlens=[192],  # 3 pages active
+            num_pages=8,
+        )
+    )
+    with pytest.raises(ValueError, match="active page IDs must be in"):
+        create_paged_plan(q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q)
+
+
+def test_paged_plan_rejects_high_page_id() -> None:
+    """A page ID equal to num_pages (out of range) must fail."""
+    num_pages = 8
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_validation_inputs(
+            page_ids=[[0, 1, num_pages]],  # last active id == num_pages (OOB)
+            cache_seqlens=[192],
+            num_pages=num_pages,
+        )
+    )
+    with pytest.raises(ValueError, match="active page IDs must be in"):
+        create_paged_plan(q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q)
+
+
+def test_paged_plan_accepts_page_id_at_capacity_minus_one() -> None:
+    """A page ID at num_pages - 1 (the last valid page) must succeed."""
+    num_pages = 8
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_validation_inputs(
+            page_ids=[[num_pages - 1]],
+            cache_seqlens=[64],
+            num_pages=num_pages,
+        )
+    )
+    plan = create_paged_plan(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q
+    )
+    assert plan is not None
+
+
+def test_paged_plan_ignores_padded_tail_entries() -> None:
+    """Invalid values in padded (inactive) tail entries must not cause rejection."""
+    num_pages = 8
+    # Active: 1 page (cache_seqlen=64).  Tail: filled with 9999 (invalid).
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_validation_inputs(
+            page_ids=[[0, 9999, 9999]],
+            cache_seqlens=[64],  # only 1 page active
+            num_pages=num_pages,
+        )
+    )
+    plan = create_paged_plan(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q
+    )
+    assert plan is not None
+
+
+def test_paged_plan_rejects_int32_max_page_id_above_capacity() -> None:
+    """INT32_MAX as a page ID must fail when it exceeds the physical capacity."""
+    num_pages = 8
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_validation_inputs(
+            page_ids=[[0, 1, 2147483647]],  # INT32_MAX
+            cache_seqlens=[192],
+            num_pages=num_pages,
+        )
+    )
+    with pytest.raises(ValueError, match="active page IDs must be in"):
+        create_paged_plan(q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q)
+
+
+def test_paged_plan_accepts_big_pid_past_int32_byte_offset() -> None:
+    """Valid high recycled page IDs past the signed-Int32 byte-offset line must
+
+    remain accepted (AGENTS.md big-pid corollary).
+    """
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    kv_heads = 1
+    q_heads = 8
+    cache_seqlen = page_size + 1  # 2 active pages
+    live_page_count = 2
+
+    element_size = torch.empty((), dtype=torch.bfloat16).element_size()
+    page_stride_bytes = page_size * kv_heads * head_dim * element_size
+    int32_max = torch.iinfo(torch.int32).max
+    high_page_id = int32_max // page_stride_bytes + 2
+    num_cache_pages = high_page_id + live_page_count
+
+    # Allocate a large mostly-uninitialized pool and point the page table at
+    # its tail, per the AGENTS.md big-pid testing corollary.
+    k_cache = torch.empty(
+        (num_cache_pages, page_size, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.empty(
+        (num_cache_pages, page_size, kv_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    k_cache[high_page_id:num_cache_pages].normal_().div_(4)
+    v_cache[high_page_id:num_cache_pages].normal_().div_(4)
+
+    page_table = torch.arange(
+        high_page_id,
+        num_cache_pages,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(0)
+    # Pad tail with the last valid id.
+    page_table = torch.nn.functional.pad(
+        page_table, (0, max(0, 4 - page_table.shape[1])), value=high_page_id + live_page_count - 1
+    )
+    cache_seqlens = torch.tensor([cache_seqlen], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    q = torch.randn(1, q_heads, head_dim, dtype=torch.bfloat16, device=device)
+
+    assert int(page_table[0, 0].item()) * page_stride_bytes > int32_max
+
+    plan = create_paged_plan(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q
+    )
+    assert plan is not None
+
+
+def test_paged_plan_rejects_negative_page_id_in_second_request() -> None:
+    """A negative ID in any request, not just the first, must be caught."""
+    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = (
+        _make_validation_inputs(
+            page_ids=[[0, 1], [2, -1]],
+            cache_seqlens=[128, 128],
+            num_pages=8,
+        )
+    )
+    with pytest.raises(ValueError, match="active page IDs must be in"):
+        create_paged_plan(q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q)
+
+
+def test_paged_plan_validation_uses_min_k_v_pages() -> None:
+    """When K and V have different page counts, the bound is min(k, v)."""
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    kv_heads = 1
+    num_k_pages = 10
+    num_v_pages = 6
+    q = torch.randn(1, 8, head_dim, dtype=torch.bfloat16, device=device)
+    k_cache = torch.randn(
+        num_k_pages, page_size, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn(
+        num_v_pages, page_size, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    # Page ID 7 is valid for K (10 pages) but invalid for V (6 pages).
+    page_table = torch.tensor([[7]], dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([64], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+
+    with pytest.raises(ValueError, match="active page IDs must be in"):
+        create_paged_plan(q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q)
+
+    # Page ID 5 (= min(10, 6) - 1) must succeed.
+    page_table[0, 0] = 5
+    plan = create_paged_plan(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q
+    )
+    assert plan is not None
