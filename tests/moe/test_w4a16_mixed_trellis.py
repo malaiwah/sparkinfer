@@ -282,8 +282,10 @@ def _serial_tier(
 
 @pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
 @pytest.mark.parametrize("route_ids_dtype", [torch.int32, torch.int64])
-def test_mixed_k3_k4_matches_serial_and_captures(
+@pytest.mark.parametrize("lower_bits", [2, 3])
+def test_mixed_lower_k4_matches_serial_and_captures(
     route_ids_dtype: torch.dtype,
+    lower_bits: int,
 ) -> None:
     torch.manual_seed(20260730)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -292,7 +294,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         experts=2,
         hidden=hidden,
         intermediate=intermediate,
-        bits=3,
+        bits=lower_bits,
         seed=301,
         device=device,
     )
@@ -305,8 +307,8 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         device=device,
     )
     x = (torch.randn((m, hidden), device=device) * 1.0e-3).to(torch.bfloat16)
-    # Global expert ids deliberately interleave K3 and K4 tiers. The combined
-    # namespace remains tier ordered so weight and rotation tables stay dense.
+    # Global expert ids deliberately interleave lower and K4 tiers. The
+    # combined namespace remains tier ordered so weight and rotation tables stay dense.
     topk_ids = torch.tensor([[0, 1], [3, 2]], dtype=route_ids_dtype, device=device)
     topk_weights = torch.tensor(
         [[0.65, 0.35], [0.2, 0.8]], dtype=torch.float32, device=device
@@ -330,6 +332,7 @@ def test_mixed_k3_k4_matches_serial_and_captures(
         max_shared_mem=int(props.shared_memory_per_block_optin),
         force_tile_config=(128, 128, 128, 128),
         route_ids_dtype=route_ids_dtype,
+        tier0_bits=lower_bits,
     )
     assert launch.local_memory_bytes == 0
     global_to_combined, descriptor = build_tiered_maps((2, 0), (3, 1), device=device)

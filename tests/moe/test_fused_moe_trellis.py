@@ -102,24 +102,16 @@ def test_fused_moe_metadata_advertises_trellis_input_dtypes() -> None:
     assert {"bf16", "fp16"}.issubset(FUSED_MOE_META.dtypes)
 
 
-def test_exl3_trellis_plan_accepts_k3_and_rejects_k2() -> None:
-    assert _weight_plan(
-        num_experts=1,
-        hidden_size=128,
-        intermediate_size=128,
-        input_dtype=torch.bfloat16,
-        trellis_bits=3,
-        tile_config=(64, 128, 64, 128),
-    ).trellis_bits == 3
-    with pytest.raises(ValueError, match=r"\(3, 4, 5, 6\)"):
-        _weight_plan(
+def test_exl3_trellis_plan_accepts_k2_and_k3() -> None:
+    for bits in (2, 3):
+        assert _weight_plan(
             num_experts=1,
             hidden_size=128,
             intermediate_size=128,
             input_dtype=torch.bfloat16,
-            trellis_bits=2,
+            trellis_bits=bits,
             tile_config=(64, 128, 64, 128),
-        )
+        ).trellis_bits == bits
 
 
 def test_qsrt_atom_plan_is_explicit_and_fail_closed() -> None:

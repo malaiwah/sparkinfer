@@ -320,7 +320,7 @@ class MoEWeightPreparationPlan:
                 if self.source_format == "qsrt_sqg_e4m3"
                 else (5, 6)
                 if self.source_format == "sqg_fp16_d3l"
-                else (3, 4, 5, 6)
+                else (2, 3, 4, 5, 6)
             )
             if bits not in valid_bits:
                 raise ValueError(
