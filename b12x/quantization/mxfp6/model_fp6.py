@@ -105,6 +105,9 @@ class SafetensorsModel:
     def shape_of(self, key: str) -> tuple[int, ...]:
         return tuple(self._handle(key).get_slice(key).get_shape())
 
+    def dtype_of(self, key: str) -> str:
+        return str(self._handle(key).get_slice(key).get_dtype())
+
 
 @dataclass
 class MoEExpertScheme:

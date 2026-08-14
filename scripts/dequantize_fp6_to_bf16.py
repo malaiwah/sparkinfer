@@ -27,6 +27,18 @@ import torch
 
 from b12x.quantization.mxfp6 import dequantize_fp6_checkpoint_to_bf16
 
+_DEFAULT_MAX_WORKING_BYTES = 32 * 1024**3
+
+
+def _working_bytes(value: str) -> int | None:
+    if value.lower() == "none":
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("working-set budget must be positive")
+    return parsed
+
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -37,10 +49,25 @@ def main() -> None:
     parser.add_argument(
         "--no-gpu", action="store_true", help="dequantize on CPU (slower)"
     )
+    parser.add_argument(
+        "--max-working-bytes",
+        type=_working_bytes,
+        default=_DEFAULT_MAX_WORKING_BYTES,
+        help=(
+            "hard cumulative dequantization/writer memory budget in bytes "
+            f"(default: {_DEFAULT_MAX_WORKING_BYTES}); use 'none' only for a "
+            "trusted offline checkpoint"
+        ),
+    )
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() and not args.no_gpu else "cpu"
-    report = dequantize_fp6_checkpoint_to_bf16(args.model, args.out, device=device)
+    report = dequantize_fp6_checkpoint_to_bf16(
+        args.model,
+        args.out,
+        device=device,
+        max_dequant_working_bytes=args.max_working_bytes,
+    )
     print(
         f"\ndone: dequantized={report.quantized_tensors} "
         f"copied={report.copied_tensors} shards={report.shards} "

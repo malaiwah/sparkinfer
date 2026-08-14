@@ -21,16 +21,21 @@ its original dtype and recorded in ``quantization_config.exclude_modules``.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import shutil
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
 from .fp6_checkpoint import (
     QUANT_ALGO,
+    _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES,
+    _estimate_fp6_dequant_working_bytes,
     build_quantization_config,
     dequantize_linear_from_fp6,
     quantize_linear_to_fp6,
@@ -184,12 +189,23 @@ class _ErrorStats:
 class _ShardWriter:
     """Stream tensors to size-capped safetensors shards, then finalize the index."""
 
-    def __init__(self, out_dir: pathlib.Path, *, max_shard_bytes: int):
+    def __init__(
+        self,
+        out_dir: pathlib.Path,
+        *,
+        max_shard_bytes: int,
+        max_buffer_bytes: Optional[int] = None,
+    ):
         from safetensors.torch import save_file
 
+        if max_shard_bytes <= 0:
+            raise ValueError("max_shard_bytes must be positive")
+        if max_buffer_bytes is not None and max_buffer_bytes <= 0:
+            raise ValueError("max_buffer_bytes must be positive or None")
         self._save_file = save_file
         self.out_dir = out_dir
         self.max_shard_bytes = max_shard_bytes
+        self.max_buffer_bytes = max_buffer_bytes
         self._buf: dict[str, torch.Tensor] = {}
         self._buf_bytes = 0
         self._shard_keys: list[list[str]] = []  # provisional shard idx -> keys
@@ -197,13 +213,24 @@ class _ShardWriter:
         self.total_bytes = 0
 
     def add(self, key: str, tensor: torch.Tensor) -> None:
-        t = tensor.detach().cpu().contiguous()
-        nbytes = t.numel() * t.element_size()
-        if self._buf_bytes and self._buf_bytes + nbytes > self.max_shard_bytes:
+        nbytes = tensor.numel() * tensor.element_size()
+        buffer_limit = self.max_shard_bytes
+        if self.max_buffer_bytes is not None:
+            buffer_limit = min(buffer_limit, self.max_buffer_bytes)
+        if nbytes > buffer_limit:
+            raise ValueError(
+                f"tensor {key!r} requires {nbytes} staging bytes, exceeding "
+                f"the writer payload limit {buffer_limit} bytes"
+            )
+        if self._buf_bytes and self._buf_bytes + nbytes > buffer_limit:
             self._flush()
+        t = tensor.detach().cpu().contiguous()
         self._buf[key] = t
         self._buf_bytes += nbytes
         self.total_bytes += nbytes
+
+    def flush_pending(self) -> None:
+        self._flush()
 
     def add_many(self, tensors: dict[str, torch.Tensor]) -> None:
         for key, tensor in tensors.items():
@@ -706,12 +733,225 @@ def export_dense_model_to_fp6_safetensors(
     return report
 
 
+@contextmanager
+def _staged_output_directory(
+    destination: pathlib.Path,
+) -> Iterator[pathlib.Path]:
+    """Publish a complete new output directory or leave no output behind."""
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise FileExistsError(
+            f"refusing to replace existing output directory {destination}"
+        )
+    staging = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.staging-",
+            dir=destination.parent,
+        )
+    )
+    try:
+        yield staging
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+_SERIALIZER_OVERHEAD_BYTES = 8 * 1024 * 1024
+_SAFETENSORS_ITEMSIZE = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I16": 2,
+    "U16": 2,
+    "F16": 2,
+    "BF16": 2,
+    "I32": 4,
+    "U32": 4,
+    "F32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F64": 8,
+}
+_FP6_SIDECAR_SUFFIXES = (
+    ".weight_scale_2",
+    ".weight_scale",
+    ".input_scale",
+)
+
+
+def _shape_numel(shape: tuple[int, ...]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return numel
+
+
+def _metadata_nbytes(model: SafetensorsModel, key: str) -> int:
+    dtype = model.dtype_of(key)
+    itemsize = _SAFETENSORS_ITEMSIZE.get(dtype)
+    if itemsize is None:
+        raise ValueError(f"cannot bound unsupported safetensors dtype {dtype!r}")
+    return _shape_numel(model.shape_of(key)) * itemsize
+
+
+def _metadata_reserve_bytes(
+    model: SafetensorsModel, keys: list[str]
+) -> int:
+    """Conservatively reserve Python, safetensors, and index metadata."""
+    reserve = _SERIALIZER_OVERHEAD_BYTES
+    for key in keys:
+        key_bytes = len(key.encode("utf-8"))
+        rank = len(model.shape_of(key))
+        reserve += 4096 + 16 * key_bytes + 256 * rank
+    return reserve
+
+
+
+
+def _fp6_group_inventory(model: SafetensorsModel) -> set[str]:
+    groups: set[str] = set()
+    for key in model.keys():
+        for suffix in _FP6_SIDECAR_SUFFIXES:
+            if key.endswith(suffix):
+                groups.add(key[: -len(suffix)])
+                break
+    return groups
+
+
+def _preflight_fp6_dequant_checkpoint(
+    model: SafetensorsModel,
+    quantized: set[str],
+    *,
+    max_working_bytes: Optional[int],
+    max_shard_bytes: int,
+) -> int:
+    """Validate the entire checkpoint and return the safe writer payload cap."""
+    if isinstance(max_shard_bytes, bool) or not isinstance(max_shard_bytes, int):
+        raise TypeError("max_shard_bytes must be a positive integer")
+    if max_shard_bytes <= 0:
+        raise ValueError("max_shard_bytes must be positive")
+    keys = list(model.keys())
+    if max_working_bytes is not None:
+        if isinstance(max_working_bytes, bool) or not isinstance(
+            max_working_bytes, int
+        ):
+            raise TypeError(
+                "max_dequant_working_bytes must be a positive integer or None"
+            )
+        metadata_reserve = _metadata_reserve_bytes(model, keys)
+        if max_working_bytes <= metadata_reserve:
+            raise ValueError(
+                "max_dequant_working_bytes must exceed the checkpoint "
+                f"serializer/index metadata reserve ({metadata_reserve} bytes)"
+            )
+        writer_limit = min(
+            max_shard_bytes,
+            (max_working_bytes - metadata_reserve) // 2,
+        )
+    else:
+        writer_limit = max_shard_bytes
+    consumed_keys = {
+        name + suffix
+        for name in quantized
+        for suffix in (".weight", *_FP6_SIDECAR_SUFFIXES)
+    }
+
+    for key in keys:
+        nbytes = _metadata_nbytes(model, key)
+        if key not in consumed_keys:
+            if nbytes > writer_limit:
+                raise ValueError(
+                    f"copy-through tensor {key!r} needs {nbytes} bytes, "
+                    f"exceeding writer payload limit {writer_limit}"
+                )
+
+    float_dtypes = {"F16", "BF16", "F32", "F64"}
+    for name in sorted(quantized):
+        packed_key = name + ".weight"
+        scale_key = name + ".weight_scale"
+        ws2_key = name + ".weight_scale_2"
+        input_scale_key = name + ".input_scale"
+        required = (packed_key, scale_key, ws2_key, input_scale_key)
+        missing = [key for key in required if not model.has(key)]
+        if missing:
+            raise ValueError(
+                f"incomplete FP6 tensor group {name!r}; missing {missing}"
+            )
+        packed_shape = model.shape_of(packed_key)
+        if model.dtype_of(packed_key) != "U8":
+            raise ValueError(
+                f"{packed_key} must have safetensors dtype U8, got "
+                f"{model.dtype_of(packed_key)}"
+            )
+        if len(packed_shape) != 2:
+            raise ValueError(
+                f"{packed_key} must be rank 2, got shape {packed_shape}"
+            )
+        rows, packed_k = packed_shape
+        if rows <= 0 or packed_k <= 0 or (packed_k * 4) % 3:
+            raise ValueError(
+                f"{packed_key} has invalid packed FP6 shape {packed_shape}"
+            )
+        k = packed_k * 4 // 3
+        if k % 32:
+            raise ValueError(
+                f"{packed_key} decodes to K={k}, which is not divisible by 32"
+            )
+        if model.dtype_of(scale_key) != "U8":
+            raise ValueError(
+                f"{scale_key} must have safetensors dtype U8, got "
+                f"{model.dtype_of(scale_key)}"
+            )
+        expected_scale_shape = (rows, k // 32)
+        if model.shape_of(scale_key) != expected_scale_shape:
+            raise ValueError(
+                f"{scale_key} shape {model.shape_of(scale_key)} does not match "
+                f"packed weight; expected {expected_scale_shape}"
+            )
+        ws2_numel = _shape_numel(model.shape_of(ws2_key))
+        if ws2_numel not in (1, rows) or model.dtype_of(ws2_key) not in float_dtypes:
+            raise ValueError(
+                f"{ws2_key} must contain 1 or {rows} floating-point values"
+            )
+        if (
+            _shape_numel(model.shape_of(input_scale_key)) != 1
+            or model.dtype_of(input_scale_key) not in float_dtypes
+        ):
+            raise ValueError(
+                f"{input_scale_key} must contain one floating-point value"
+            )
+        output_bytes = rows * k * 2
+        if output_bytes > writer_limit:
+            raise ValueError(
+                f"{packed_key} produces {output_bytes} BF16 staging bytes, "
+                f"exceeding writer payload limit {writer_limit}"
+            )
+        estimated = _estimate_fp6_dequant_working_bytes(rows, k)
+        if max_working_bytes is not None:
+            cumulative_peak = estimated + rows * k * 4
+            if cumulative_peak > max_working_bytes:
+                raise ValueError(
+                    "FP6 dequantization cumulative working set exceeds the "
+                    f"operator budget: {packed_key} needs {cumulative_peak} "
+                    f"bytes, budget {max_working_bytes} bytes"
+                )
+    return writer_limit
+
+
 def dequantize_fp6_checkpoint_to_bf16(
     model_path: str | pathlib.Path,
     out_dir: str | pathlib.Path,
     *,
     device: str = "cuda",
     max_shard_bytes: int = 4 * 1024**3,
+    max_dequant_working_bytes: Optional[int] = (
+        _DEFAULT_FP6_DEQUANT_MAX_WORKING_BYTES
+    ),
     verbose: bool = True,
 ) -> ExportReport:
     """Decode an FP6 checkpoint back to a plain BF16 HF checkpoint.
@@ -722,6 +962,9 @@ def dequantize_fp6_checkpoint_to_bf16(
     The output runs on stock vLLM with no b12x involvement, so a KLD
     against the original BF16 model isolates *weight* quantization error from
     the runtime W6A6 *activation* quantization error.
+
+    ``max_dequant_working_bytes`` bounds each vectorized tensor decode; ``None``
+    explicitly disables the cap for a trusted offline conversion.
     """
     model = SafetensorsModel(model_path)
     qcfg = model.config.get("quantization_config") or {}
@@ -730,13 +973,21 @@ def dequantize_fp6_checkpoint_to_bf16(
             f"{model_path} is not a b12x FP6 checkpoint "
             f"(quant_algo={qcfg.get('quant_algo')!r})"
         )
-    fmt = qcfg.get("weight_format", "e2m3")
+    if "weight_format" not in qcfg:
+        raise ValueError("FP6 quantization_config is missing weight_format")
+    fmt = qcfg["weight_format"]
+    if fmt not in {"e2m3", "e3m2"}:
+        raise ValueError(
+            f"weight_format must be 'e2m3' or 'e3m2', got {fmt!r}"
+        )
 
-    quantized = {
-        k[: -len(".weight_scale")]
-        for k in model.keys()
-        if k.endswith(".weight_scale") and not k.endswith(".weight_scale_2")
-    }
+    quantized = _fp6_group_inventory(model)
+    writer_limit = _preflight_fp6_dequant_checkpoint(
+        model,
+        quantized,
+        max_working_bytes=max_dequant_working_bytes,
+        max_shard_bytes=max_shard_bytes,
+    )
     report = ExportReport(arch="dequant-bf16", out_dir=str(out_dir))
     if verbose:
         print(
@@ -744,47 +995,61 @@ def dequantize_fp6_checkpoint_to_bf16(
             f"-> BF16 {out_dir}"
         )
 
-    out = pathlib.Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    writer = _ShardWriter(out, max_shard_bytes=max_shard_bytes)
-    drop_suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
+    destination = pathlib.Path(out_dir)
+    with _staged_output_directory(destination) as out:
+        writer = _ShardWriter(
+            out,
+            max_shard_bytes=max_shard_bytes,
+            max_buffer_bytes=writer_limit,
+        )
+        drop_suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
 
-    for key in model.keys():
-        base = key
-        for suffix in drop_suffixes:
-            if key.endswith(suffix):
-                base = key[: -len(suffix)]
-                break
-        if base != key and base in quantized:
-            continue  # consumed by the dequantized .weight emission
-        if key.endswith(".weight") and key[: -len(".weight")] in quantized:
-            name = key[: -len(".weight")]
-            packed = model.get_tensor(key).to(device)
-            scale = model.get_tensor(name + ".weight_scale").to(device)
-            ws2_key = name + ".weight_scale_2"
-            ws2 = model.get_tensor(ws2_key).to(device) if model.has(ws2_key) else None
-            w = dequantize_linear_from_fp6(
-                packed, scale, fmt=fmt, weight_scale_2=ws2
-            )
-            writer.add(key, w.to(torch.bfloat16))
-            report.quantized_tensors += 1
-            del packed, scale, w
-            if device == "cuda":
-                torch.cuda.empty_cache()
-        else:
-            writer.add(key, model.get_tensor(key))
-            report.copied_tensors += 1
+        for key in model.keys():
+            base = key
+            for suffix in drop_suffixes:
+                if key.endswith(suffix):
+                    base = key[: -len(suffix)]
+                    break
+            if base != key and base in quantized:
+                continue  # consumed by the dequantized .weight emission
+            if key.endswith(".weight") and key[: -len(".weight")] in quantized:
+                name = key[: -len(".weight")]
+                writer.flush_pending()
+                packed = model.get_tensor(key).to(device)
+                scale = model.get_tensor(name + ".weight_scale").to(device)
+                ws2_key = name + ".weight_scale_2"
+                ws2 = (
+                    model.get_tensor(ws2_key).to(device)
+                    if model.has(ws2_key)
+                    else None
+                )
+                w = dequantize_linear_from_fp6(
+                    packed,
+                    scale,
+                    fmt=fmt,
+                    weight_scale_2=ws2,
+                    max_working_bytes=max_dequant_working_bytes,
+                )
+                writer.add(key, w.to(torch.bfloat16))
+                report.quantized_tensors += 1
+                del packed, scale, w
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                writer.add(key, model.get_tensor(key))
+                report.copied_tensors += 1
 
-    report.shards = writer.finalize()
-    report.total_bytes = writer.total_bytes
-    cfg = dict(model.config)
-    cfg.pop("quantization_config", None)
-    (out / "config.json").write_text(json.dumps(cfg, indent=2))
-    _copy_aux_files(pathlib.Path(model_path), out)
+        report.shards = writer.finalize()
+        report.total_bytes = writer.total_bytes
+        cfg = dict(model.config)
+        cfg.pop("quantization_config", None)
+        (out / "config.json").write_text(json.dumps(cfg, indent=2))
+        _copy_aux_files(pathlib.Path(model_path), out)
     if verbose:
         print(
             f"[fp6-dequant] done: dequantized={report.quantized_tensors} "
-            f"copied={report.copied_tensors} shards={report.shards} -> {out}"
+            f"copied={report.copied_tensors} shards={report.shards} "
+            f"-> {destination}"
         )
     return report
 
