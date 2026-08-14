@@ -1270,6 +1270,7 @@ class B12XPagedAttentionScratch:
                 kv_window_start_tokens=self.kv_window_start_tokens,
                 kv_chunk_size=int(self._plan.kv_chunk_size),
                 page_size=self.page_size,
+                num_cache_pages=self.caps.num_cache_pages,
             )
             batch = int(self.cache_seqlens.shape[0])
             if int(self.cu_seqlens_q.shape[0]) < batch + 1:

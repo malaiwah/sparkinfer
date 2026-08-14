@@ -247,6 +247,7 @@ def _issue_paged_kv_tma_copy_planes_tma(
     request_idx,
     tile_token_base,
     page_size,
+    num_cache_pages,
 ):
     page_idx = tile_token_base // page_size
     page_id = (
@@ -255,6 +256,12 @@ def _issue_paged_kv_tma_copy_planes_tma(
             os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
+    )
+    # Bound page_id to physical KV-cache capacity before forming any address.
+    page_id = cutlass.select_(
+        (page_id >= Int32(0)) and (page_id < num_cache_pages),
+        page_id,
+        Int32(0),
     )
     pipeline_tma.producer_acquire(producer_state)
     load_tma0(src_idx=page_id, producer_state=producer_state)
@@ -273,6 +280,7 @@ def _issue_paged_kv_tma_copy_2planes_tma(
     request_idx,
     tile_token_base,
     page_size,
+    num_cache_pages,
 ):
     page_idx = tile_token_base // page_size
     page_id = (
@@ -281,6 +289,11 @@ def _issue_paged_kv_tma_copy_2planes_tma(
             os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
+    )
+    page_id = cutlass.select_(
+        (page_id >= Int32(0)) and (page_id < num_cache_pages),
+        page_id,
+        Int32(0),
     )
     pipeline_tma.producer_acquire(producer_state)
     load_tma0(src_idx=page_id, producer_state=producer_state)
@@ -299,6 +312,7 @@ def _issue_paged_kv_tma_copy_2planes_tma_single_stage(
     tile_token_base,
     page_size,
     stage_tile_rows,
+    num_cache_pages,
 ):
     _issue_paged_kv_tma_copy_2planes_tma_manual(
         load_tma0,
@@ -311,6 +325,7 @@ def _issue_paged_kv_tma_copy_2planes_tma_single_stage(
         tile_token_base,
         page_size,
         stage_tile_rows,
+        num_cache_pages,
     )
 
 
@@ -326,6 +341,7 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
     tile_token_base,
     page_size,
     stage_tile_rows,
+    num_cache_pages,
 ):
     page_idx = tile_token_base // page_size
     page_row_offset = tile_token_base - page_idx * page_size
@@ -338,21 +354,20 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
         )
         else mPageTable[request_idx, page_idx]
     )
+    page_id_valid = (page_id >= Int32(0)) and (page_id < num_cache_pages)
+    page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(
             full_mbar_ptr,
-            expected_bytes,
+            cutlass.select_(page_id_valid, expected_bytes, Int32(0)),
         )
-    # A page id is an allocator-owned pool coordinate.  Production pools can
-    # hand out ids whose byte address is beyond the signed-Int32 range even
-    # though the page table itself stores Int32 ids, so widen before scaling it
-    # into the flattened TMA-tile coordinate.
     src_idx = (
         Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
     )
-    load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
-    load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    if page_id_valid:
+        load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+        load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 @cute.jit
@@ -367,6 +382,7 @@ def _issue_paged_kv_tma_copy_1plane_tma_manual(
     page_size,
     stage_tile_rows,
     page_tiles_per_entry,
+    num_cache_pages,
 ):
     page_idx = tile_token_base // page_size
     page_row_offset = tile_token_base - page_idx * page_size
@@ -378,18 +394,19 @@ def _issue_paged_kv_tma_copy_1plane_tma_manual(
         )
         else mPageTable[request_idx, page_idx]
     )
+    page_id_valid = (page_id >= Int32(0)) and (page_id < num_cache_pages)
+    page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(
             full_mbar_ptr,
-            expected_bytes,
+            cutlass.select_(page_id_valid, expected_bytes, Int32(0)),
         )
-    # The page-table id scales by the physical cache stride. Combined K/V
-    # caches can span more TMA tiles per allocator entry than the logical page.
     src_idx = (
         Int64(page_id) * Int64(page_tiles_per_entry) + Int64(page_tile_idx)
     )
-    load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    if page_id_valid:
+        load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 @cute.jit
@@ -406,6 +423,7 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
     tile_token_base,
     page_size,
     stage_tile_rows,
+    num_cache_pages,
 ):
     page_idx = tile_token_base // page_size
     page_row_offset = tile_token_base - page_idx * page_size
@@ -418,20 +436,22 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
         )
         else mPageTable[request_idx, page_idx]
     )
+    page_id_valid = (page_id >= Int32(0)) and (page_id < num_cache_pages)
+    page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(
             full_mbar_ptr,
-            expected_bytes,
+            cutlass.select_(page_id_valid, expected_bytes, Int32(0)),
         )
-    # Keep the page-scaled coordinate in Int64 for large/recycled serving pools.
     src_idx = (
         Int64(page_id) * Int64(page_tiles_per_page) + Int64(page_tile_idx)
     )
-    load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
-    load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
-    load_tma2(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
-    load_tma3(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+    if page_id_valid:
+        load_tma0(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+        load_tma1(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+        load_tma2(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
+        load_tma3(src_idx=src_idx, dst_idx=producer_state.index, tma_bar_ptr=full_mbar_ptr)
 
 
 @dsl_user_op
@@ -1071,6 +1091,31 @@ def _apply_relative_attention_bias(
                         frag_s[mma_q, mma_kv, reg_id] += bias * inverse_softmax_scale
 
 
+@cute.jit
+def _zero_smem_stage_cooperative(
+    sStageBytes: cute.Tensor,
+    stage_byte_offset: Int32,
+    stage_bytes: Int32,
+    tidx: Int32,
+    num_threads: Int32,
+):
+    """Cooperatively zero a SMEM stage byte range.
+
+    Called after TMA/cp.async consumer wait when the page_id for this
+    tile is invalid, ensuring no stale or page-0 data reaches the MMA.
+    """
+    num_words = stage_bytes // Int32(4)
+    word_offset = stage_byte_offset // Int32(4)
+    linear = tidx
+    while linear < num_words:
+        cute.make_tensor(
+            sStageBytes.iterator + Int32(word_offset + linear) * Int32(4),
+            cute.make_layout((1,), stride=(1,)),
+            cutlass.Uint32,
+        )[0] = Uint32(0)
+        linear += num_threads
+
+
 @dsl_user_op
 def _exit_thread(
     *,
@@ -1119,6 +1164,16 @@ def _issue_paged_kv_cp_async_64x128(
         )
         else mPageTable[request_idx, page_idx]
     )
+    # Bound page_id to physical KV-cache capacity.  An out-of-range id is
+    # clamped to page 0 for safe address formation, but the cp.async predicate
+    # is set to 0 so the load is skipped and SMEM retains zeros.
+    _num_cache_pages = cutlass.select_(
+        mKCache.shape[0] < mVCache.shape[0],
+        Int32(mKCache.shape[0]),
+        Int32(mVCache.shape[0]),
+    )
+    page_id_valid = (page_id >= Int32(0)) and (page_id < _num_cache_pages)
+    page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
     k_smem_base_addr = shared_ptr_to_u32(sKStageBytes.iterator)
     v_smem_base_addr = shared_ptr_to_u32(sVStageBytes.iterator)
     row = tidx // Int32(8)
@@ -1141,15 +1196,15 @@ def _issue_paged_kv_cp_async_64x128(
     dst_addr_v = _smem_addr_from_b128_offset(v_smem_base_addr, dst_offset)
 
     for _ in cutlass.range_constexpr(4):
-        _cp_async_load_128b_pred(
+        _cp_async_load_128b_zfill(
             dst_addr_k,
             get_ptr_as_int64(mKCache, src_offset_k),
-            Int32(1),
+            cutlass.select_(page_id_valid, Int32(16), Int32(0)),
         )
-        _cp_async_load_128b_pred(
+        _cp_async_load_128b_zfill(
             dst_addr_v,
             get_ptr_as_int64(mVCache, src_offset_v),
-            Int32(1),
+            cutlass.select_(page_id_valid, Int32(16), Int32(0)),
         )
         src_offset_k += Int64(16) * Int64(mKCache.stride[1])
         src_offset_v += Int64(16) * Int64(mVCache.stride[1])
@@ -3709,6 +3764,7 @@ class PagedForwardKernel:
         warp_linear_idx,
         valid_rows,
         upcast_stride,
+        num_cache_pages,
         fill_zero: cutlass.Constexpr,
     ):
         page_size = Int32(self.page_size)
@@ -3724,6 +3780,12 @@ class PagedForwardKernel:
             page_iter = token_idx // page_size
             entry_idx = token_idx - page_iter * page_size
             page_id = mPageTable[request_idx, page_iter]
+            # Bound page_id to physical KV-cache capacity.  An out-of-range
+            # id is clamped to page 0 for safe address formation, but the
+            # load is zero-filled (cp.async zfill) / predicated off so the
+            # invalid page data never aliases real KV content.
+            page_id_valid = (page_id >= Int32(0)) and (page_id < num_cache_pages)
+            page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
             row_valid = row_idx < valid_rows
             row_byte_base = (
                 Int64(page_id) * Int64(page_stride_bytes)
@@ -3737,7 +3799,7 @@ class PagedForwardKernel:
                     stage_byte_offset
                     + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
                 )
-                vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
+                vec_valid = row_valid and page_id_valid and (vec_idx * Int32(16) < row_bytes)
                 if const_expr(fill_zero):
                     _cp_async_load_128b_zfill(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
@@ -3745,10 +3807,12 @@ class PagedForwardKernel:
                         cutlass.select_(vec_valid, Int32(16), Int32(0)),
                     )
                 else:
-                    _cp_async_load_128b_pred(
+                    # Use zfill for both valid and invalid: when vec_valid is
+                    # false, src_bytes=0 zero-fills instead of leaving stale SMEM.
+                    _cp_async_load_128b_zfill(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        Int32(vec_valid),
+                        cutlass.select_(vec_valid, Int32(16), Int32(0)),
                     )
 
     @cute.jit
@@ -3772,6 +3836,7 @@ class PagedForwardKernel:
         request_idx,
         page_idx,
         sub_tile,
+        num_cache_pages,
     ):
         page_id = (
             Int32(0)
@@ -3780,6 +3845,11 @@ class PagedForwardKernel:
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
+        )
+        page_id = cutlass.select_(
+            (page_id >= Int32(0)) and (page_id < num_cache_pages),
+            page_id,
+            Int32(0),
         )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
@@ -3800,6 +3870,7 @@ class PagedForwardKernel:
         request_idx,
         page_idx,
         sub_tile,
+        num_cache_pages,
     ):
         page_id = (
             Int32(0)
@@ -3808,6 +3879,11 @@ class PagedForwardKernel:
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
+        )
+        page_id = cutlass.select_(
+            (page_id >= Int32(0)) and (page_id < num_cache_pages),
+            page_id,
+            Int32(0),
         )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
@@ -3826,6 +3902,7 @@ class PagedForwardKernel:
         request_idx,
         page_idx,
         sub_tile,
+        num_cache_pages,
     ):
         page_id = (
             Int32(0)
@@ -3834,6 +3911,11 @@ class PagedForwardKernel:
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
+        )
+        page_id = cutlass.select_(
+            (page_id >= Int32(0)) and (page_id < num_cache_pages),
+            page_id,
+            Int32(0),
         )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
@@ -3850,6 +3932,7 @@ class PagedForwardKernel:
         request_idx,
         page_idx,
         sub_tile,
+        num_cache_pages,
     ):
         page_id = (
             Int32(0)
@@ -3858,6 +3941,11 @@ class PagedForwardKernel:
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
+        )
+        page_id = cutlass.select_(
+            (page_id >= Int32(0)) and (page_id < num_cache_pages),
+            page_id,
+            Int32(0),
         )
         pipeline_tma.producer_acquire(producer_state)
         src_idx = self._tile_src_idx_from_page_id(page_id, sub_tile)
@@ -4187,6 +4275,7 @@ class PagedForwardKernel:
         self.kernel(
             mQ,
             mKCache,
+            mVCache,
             tma_tensor_K,
             tma_tensor_V,
             mPageTable,
@@ -4222,6 +4311,7 @@ class PagedForwardKernel:
         self,
         mQ: cute.Tensor,
         mKCache: cute.Tensor,
+        mVCache: cute.Tensor,
         mKCacheT: cute.Tensor,
         mVCacheT: cute.Tensor,
         mPageTable: cute.Tensor,
@@ -4244,6 +4334,17 @@ class PagedForwardKernel:
         tma_atom_K: cute.CopyAtom | None,
         tma_atom_V: cute.CopyAtom | None,
     ):
+        # Physical KV-cache page capacity for sink-local page_id bounding.
+        # Use min(K,V) from live cache tensors on every kernel invocation so
+        # graph-replay mutation or runtime cache rebinding cannot bypass the
+        # bound.  Reject zero-page pools: the planner validates >0 at plan
+        # time, and the kernel clamp treats num_cache_pages=0 as "all invalid"
+        # so every page_id is zero-filled / TMA-skipped.
+        num_cache_pages = cutlass.select_(
+            mKCache.shape[0] < mVCache.shape[0],
+            Int32(mKCache.shape[0]),
+            Int32(mVCache.shape[0]),
+        )
         lane, warp_q_idx, launch_warp_kv_idx = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
         kv_head_cta_idx = (
@@ -5288,6 +5389,7 @@ class PagedForwardKernel:
                             request_idx,
                             role_page_idx,
                             role_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(
                         self.laguna_fp8_head_pair_decode
@@ -5302,6 +5404,7 @@ class PagedForwardKernel:
                             request_idx,
                             role_page_idx,
                             role_sub_tile,
+                            num_cache_pages,
                         )
                     else:
                         self._issue_paged_kv_tma_copy_1plane(
@@ -5312,6 +5415,7 @@ class PagedForwardKernel:
                             request_idx,
                             role_page_idx,
                             role_sub_tile,
+                            num_cache_pages,
                         )
                     role_k_producer_state.advance()
                     if const_expr(self.laguna_fp8_head_pair_wide_tma):
@@ -5323,6 +5427,7 @@ class PagedForwardKernel:
                             request_idx,
                             role_page_idx,
                             role_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(
                         self.laguna_fp8_head_pair_decode
@@ -5337,6 +5442,7 @@ class PagedForwardKernel:
                             request_idx,
                             role_page_idx,
                             role_sub_tile,
+                            num_cache_pages,
                         )
                     else:
                         self._issue_paged_kv_tma_copy_1plane(
@@ -5347,6 +5453,7 @@ class PagedForwardKernel:
                             request_idx,
                             role_page_idx,
                             role_sub_tile,
+                            num_cache_pages,
                         )
                     role_v_producer_state.advance()
                     role_prefetch_base += stage_tile_rows
@@ -5643,6 +5750,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(self.k_tma_plane_count > 2):
                         self._issue_paged_kv_tma_copy_3planes(
@@ -5655,6 +5763,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(self.laguna_fp8_head_pair_wide_tma):
                         self._issue_paged_kv_tma_copy_1plane(
@@ -5665,6 +5774,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(
                         self.laguna_fp8_head_pair_decode
@@ -5679,6 +5789,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     else:
                         self._issue_paged_kv_tma_copy_1plane(
@@ -5689,6 +5800,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     if const_expr(self.v_tma_plane_count > 3):
                         self._issue_paged_kv_tma_copy_planes(
@@ -5702,6 +5814,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(self.v_tma_plane_count > 2):
                         self._issue_paged_kv_tma_copy_3planes(
@@ -5714,6 +5827,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(self.laguna_fp8_head_pair_wide_tma):
                         self._issue_paged_kv_tma_copy_1plane(
@@ -5724,6 +5838,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     elif const_expr(
                         self.laguna_fp8_head_pair_decode
@@ -5738,6 +5853,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                     else:
                         self._issue_paged_kv_tma_copy_1plane(
@@ -5748,6 +5864,7 @@ class PagedForwardKernel:
                             request_idx,
                             prefetch_page_idx,
                             prefetch_sub_tile,
+                            num_cache_pages,
                         )
                 k_producer_state.advance()
                 v_producer_state.advance()
@@ -6409,6 +6526,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 2):
                                     self._issue_paged_kv_tma_copy_3planes(
@@ -6421,6 +6539,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 1):
                                     self._issue_paged_kv_tma_copy_2planes(
@@ -6432,6 +6551,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                                 else:
                                     self._issue_paged_kv_tma_copy_1plane(
@@ -6442,6 +6562,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                             k_producer_state.advance()
                     k_consumer_state.advance()
@@ -6564,6 +6685,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 2):
                                     self._issue_paged_kv_tma_copy_3planes(
@@ -6576,6 +6698,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                                 elif const_expr(self.k_tma_plane_count > 1):
                                     self._issue_paged_kv_tma_copy_2planes(
@@ -6587,6 +6710,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                                 else:
                                     self._issue_paged_kv_tma_copy_1plane(
@@ -6597,6 +6721,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_page_idx,
                                         next_sub_tile,
+                                        num_cache_pages,
                                     )
                             k_producer_state.advance()
                     k_consumer_state.advance()
@@ -6967,6 +7092,7 @@ class PagedForwardKernel:
                                     request_idx,
                                     next_page_idx,
                                     next_sub_tile,
+                                    num_cache_pages,
                                 )
                             elif const_expr(self.v_tma_plane_count > 2):
                                 self._issue_paged_kv_tma_copy_3planes(
@@ -6979,6 +7105,7 @@ class PagedForwardKernel:
                                     request_idx,
                                     next_page_idx,
                                     next_sub_tile,
+                                    num_cache_pages,
                                 )
                             elif const_expr(self.v_tma_plane_count > 1):
                                 self._issue_paged_kv_tma_copy_2planes(
@@ -6990,6 +7117,7 @@ class PagedForwardKernel:
                                     request_idx,
                                     next_page_idx,
                                     next_sub_tile,
+                                    num_cache_pages,
                                 )
                             else:
                                 self._issue_paged_kv_tma_copy_1plane(
@@ -7000,6 +7128,7 @@ class PagedForwardKernel:
                                     request_idx,
                                     next_page_idx,
                                     next_sub_tile,
+                                    num_cache_pages,
                                 )
                         v_producer_state.advance()
                         prefetch_base += stage_tile_rows
@@ -8210,6 +8339,11 @@ class PagedFp8DecodeRawForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             1,
         )
+        _num_cache_pages = cutlass.select_(
+            mKCache.shape[0] < mVCache.shape[0],
+            Int32(mKCache.shape[0]),
+            Int32(mVCache.shape[0]),
+        )
         self.kernel(
             mQ,
             tma_tensor_K,
@@ -8226,6 +8360,7 @@ class PagedFp8DecodeRawForwardKernel:
             mVDescale,
             tma_atom_K,
             tma_atom_V,
+            _num_cache_pages,
         ).launch(
             grid=(
                 (
@@ -8260,6 +8395,7 @@ class PagedFp8DecodeRawForwardKernel:
         mVDescale: cute.Tensor | None,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
+        num_cache_pages,
     ):
         lane, warp_q_idx, warp_kv_idx = cute.arch.thread_idx()
         work_idx, kv_head_idx, block_z = cute.arch.block_idx()
@@ -8500,6 +8636,7 @@ class PagedFp8DecodeRawForwardKernel:
                 tile_base,
                 Int32(self.page_size),
                 Int32(self.stage_tile_rows),
+                num_cache_pages,
             )
             _issue_paged_kv_tma_copy_2planes_tma_single_stage(
                 load_V_tma0,
@@ -8512,6 +8649,7 @@ class PagedFp8DecodeRawForwardKernel:
                 tile_base,
                 Int32(self.page_size),
                 Int32(self.stage_tile_rows),
+                num_cache_pages,
             )
             producer_state.advance()
         cute.arch.sync_threads()
@@ -8730,6 +8868,7 @@ class PagedFp8DecodeRawForwardKernel:
                         prefetch_base,
                         Int32(self.page_size),
                         Int32(self.stage_tile_rows),
+                        num_cache_pages,
                     )
                     _issue_paged_kv_tma_copy_2planes_tma_single_stage(
                         load_V_tma0,
@@ -8742,6 +8881,7 @@ class PagedFp8DecodeRawForwardKernel:
                         prefetch_base,
                         Int32(self.page_size),
                         Int32(self.stage_tile_rows),
+                        num_cache_pages,
                     )
                     producer_state.advance()
                 prefetch_base += self.stage_tile_rows
@@ -8988,6 +9128,12 @@ class PagedBf16ExtendRawForwardKernel:
             (self.stage_tile_rows, self.kv_tma_plane_head_dim),
             1,
         )
+        _num_cache_pages = cutlass.select_(
+            mKCache.shape[0] < mVCache.shape[0],
+            Int32(mKCache.shape[0]),
+            Int32(mVCache.shape[0]),
+        )
+        launch_grid = (mBlockValidMask.shape[0], mKCache.shape[2], 1)
         self.kernel(
             mQ,
             tma_tensor_K,
@@ -9005,6 +9151,7 @@ class PagedBf16ExtendRawForwardKernel:
             mLSE,
             tma_atom_K,
             tma_atom_V,
+            _num_cache_pages,
         ).launch(
             grid=launch_grid,
             block=[32, 4, 1],
@@ -9032,6 +9179,7 @@ class PagedBf16ExtendRawForwardKernel:
         mLSE: cute.Tensor,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
+        num_cache_pages,
     ):
         lane, warp_q_idx, _ = cute.arch.thread_idx()
         work_idx, kv_head_idx, block_z = cute.arch.block_idx()
@@ -9390,6 +9538,7 @@ class PagedBf16ExtendRawForwardKernel:
                 tile_base,
                 Int32(self.page_size),
                 Int32(self.stage_tile_rows),
+                num_cache_pages,
             )
             _issue_paged_kv_tma_copy_4planes_tma_manual(
                 load_V_tma0,
@@ -9404,6 +9553,7 @@ class PagedBf16ExtendRawForwardKernel:
                 tile_base,
                 Int32(self.page_size),
                 Int32(self.stage_tile_rows),
+                num_cache_pages,
             )
             producer_state.advance()
         cute.arch.sync_threads()
@@ -9439,6 +9589,7 @@ class PagedBf16ExtendRawForwardKernel:
                     prefetch_base,
                     Int32(self.page_size),
                     Int32(self.stage_tile_rows),
+                    num_cache_pages,
                 )
                 _issue_paged_kv_tma_copy_4planes_tma_manual(
                     load_V_tma0,
@@ -9453,6 +9604,7 @@ class PagedBf16ExtendRawForwardKernel:
                     prefetch_base,
                     Int32(self.page_size),
                     Int32(self.stage_tile_rows),
+                    num_cache_pages,
                 )
                 producer_state.advance()
             stage_plane_offset = consumer_state.index * Int32(self.kv_plane_stage_bytes)
@@ -9849,6 +10001,7 @@ class PagedFp8ExtendRawForwardKernel:
         mPageTable: cute.Tensor,
         request_idx,
         tile_token_base,
+        num_cache_pages,
     ):
         if const_expr(self.kv_tma_plane_count > 1):
             _issue_paged_kv_tma_copy_2planes_tma_manual(
@@ -9862,6 +10015,7 @@ class PagedFp8ExtendRawForwardKernel:
                 tile_token_base,
                 Int32(self.page_size),
                 Int32(self.stage_tile_rows),
+                num_cache_pages,
             )
         else:
             _issue_paged_kv_tma_copy_1plane_tma_manual(
@@ -9875,6 +10029,7 @@ class PagedFp8ExtendRawForwardKernel:
                 Int32(self.page_size),
                 Int32(self.stage_tile_rows),
                 Int32(self.page_tiles_per_entry),
+                num_cache_pages,
             )
 
     def __init__(
@@ -10152,6 +10307,12 @@ class PagedFp8ExtendRawForwardKernel:
         tma_atom_K: cute.CopyAtom | None,
         tma_atom_V: cute.CopyAtom | None,
     ):
+        # Physical KV-cache page capacity for sink-local page_id bounding.
+        num_cache_pages = cutlass.select_(
+            mKCache.shape[0] < mVCache.shape[0],
+            Int32(mKCache.shape[0]),
+            Int32(mVCache.shape[0]),
+        )
         lane, warp_q_idx, _ = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
         work_idx = Int32(block_x)
@@ -10623,6 +10784,7 @@ class PagedFp8ExtendRawForwardKernel:
                     mPageTable,
                     request_idx,
                     tile_base,
+                    num_cache_pages,
                 )
                 self._issue_tma_copy(
                     load_V_tma0,
@@ -10633,6 +10795,7 @@ class PagedFp8ExtendRawForwardKernel:
                     mPageTable,
                     request_idx,
                     tile_base,
+                    num_cache_pages,
                 )
                 producer_state.advance()
         cute.arch.sync_threads()
@@ -10680,6 +10843,7 @@ class PagedFp8ExtendRawForwardKernel:
                         mPageTable,
                         request_idx,
                         prefetch_base,
+                        num_cache_pages,
                     )
                     self._issue_tma_copy(
                         load_V_tma0,
@@ -10690,6 +10854,7 @@ class PagedFp8ExtendRawForwardKernel:
                         mPageTable,
                         request_idx,
                         prefetch_base,
+                        num_cache_pages,
                     )
                     producer_state.advance()
             consume_stage_idx = consumer_state.index
@@ -10740,6 +10905,7 @@ class PagedFp8ExtendRawForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_base,
+                            num_cache_pages,
                         )
 
                 frag_S_stage0 = cute.make_rmem_tensor(frag_s_layout, Float32)
@@ -10907,6 +11073,7 @@ class PagedFp8ExtendRawForwardKernel:
                             mPageTable,
                             request_idx,
                             prefetch_base,
+                            num_cache_pages,
                         )
                         producer_state.advance()
                 if math_warp_active:
@@ -11223,6 +11390,7 @@ class PagedFp8ExtendRawForwardKernel:
                         mPageTable,
                         request_idx,
                         prefetch_base,
+                        num_cache_pages,
                     )
                     self._issue_tma_copy(
                         load_V_tma0,
@@ -11233,6 +11401,7 @@ class PagedFp8ExtendRawForwardKernel:
                         mPageTable,
                         request_idx,
                         prefetch_base,
+                        num_cache_pages,
                     )
                     producer_state.advance()
             prefetch_base += Int32(self.stage_tile_rows)

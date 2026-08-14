@@ -176,12 +176,22 @@ def materialize_paged_kv_cache(
         ].reshape(0, v_cache.shape[2], v_cache.shape[3])
     num_pages = (cache_len + page_size - 1) // page_size
     page_ids = page_table[request_idx, :num_pages].to(torch.long)
-    k = k_cache.index_select(0, page_ids).reshape(
-        num_pages * page_size, k_cache.shape[2], k_cache.shape[3]
-    )
-    v = v_cache.index_select(0, page_ids).reshape(
-        num_pages * page_size, v_cache.shape[2], v_cache.shape[3]
-    )
+    # Reject invalid active page IDs by producing zero KV for them.
+    # Never index a cache page for invalid IDs — build zero blocks directly
+    # so a zero-page pool or NaN-poisoned page 0 cannot leak.
+    num_cache_pages = min(k_cache.shape[0], v_cache.shape[0])
+    valid_mask = (page_ids >= 0) & (page_ids < num_cache_pages)
+    k_parts = []
+    v_parts = []
+    for i in range(num_pages):
+        if valid_mask[i]:
+            k_parts.append(k_cache[page_ids[i]])
+            v_parts.append(v_cache[page_ids[i]])
+        else:
+            k_parts.append(torch.zeros(page_size, k_cache.shape[2], k_cache.shape[3], dtype=k_cache.dtype, device=k_cache.device))
+            v_parts.append(torch.zeros(page_size, v_cache.shape[2], v_cache.shape[3], dtype=v_cache.dtype, device=v_cache.device))
+    k = torch.cat(k_parts, dim=0)
+    v = torch.cat(v_parts, dim=0)
     k = k[:cache_len]
     v = v[:cache_len]
     if k.dtype == torch.float8_e4m3fn:

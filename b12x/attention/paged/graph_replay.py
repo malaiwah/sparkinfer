@@ -37,6 +37,7 @@ def stage_decode_cuda_graph_metadata_triton(
     PAGE_SIZE: tl.constexpr,
     BATCH: tl.constexpr,
     MAX_PAGES: tl.constexpr,
+    NUM_CACHE_PAGES: tl.constexpr,
     HAS_SWA: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
@@ -64,9 +65,15 @@ def stage_decode_cuda_graph_metadata_triton(
     token_indices = tl.load(
         req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0
     )
+    # Validate raw source before division; check quotient in Int64.
+    # Use sentinel -1 for invalid so the kernel clamp treats it as invalid.
+    raw_valid = token_indices >= 0
+    page_ids_i64 = tl.where(raw_valid, token_indices // PAGE_SIZE, 0)
+    page_valid = raw_valid & (page_ids_i64 >= 0) & (page_ids_i64 < NUM_CACHE_PAGES)
+    safe_page_ids = tl.where(page_valid, page_ids_i64, -1).to(tl.int32)
     tl.store(
         page_table_ptr + req_idx * page_table_row_stride + page_offsets,
-        (token_indices // PAGE_SIZE).to(tl.int32),
+        safe_page_ids,
         mask=page_mask,
     )
 
@@ -82,9 +89,13 @@ def stage_decode_cuda_graph_metadata_triton(
             mask=page_mask,
             other=-1,
         )
+        swa_raw_valid = swa_token_indices >= 0
+        swa_page_ids_i64 = tl.where(swa_raw_valid, swa_token_indices // PAGE_SIZE, 0)
+        swa_page_valid = swa_raw_valid & (swa_page_ids_i64 >= 0) & (swa_page_ids_i64 < NUM_CACHE_PAGES)
+        safe_swa_page_ids = tl.where(swa_page_valid, swa_page_ids_i64, -1).to(tl.int32)
         tl.store(
             swa_page_table_ptr + req_idx * swa_page_table_row_stride + page_offsets,
-            (swa_token_indices // PAGE_SIZE).to(tl.int32),
+            safe_swa_page_ids,
             mask=page_mask,
         )
 
@@ -105,6 +116,7 @@ def patch_decode_cuda_graph_current_pages_triton(
     PAGE_SIZE: tl.constexpr,
     FILL_VALUE: tl.constexpr,
     MAX_PAGES: tl.constexpr,
+    NUM_CACHE_PAGES: tl.constexpr,
     HAS_SWA: tl.constexpr,
     HAS_OUT_CACHE_LOC_SWA: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
@@ -139,10 +151,13 @@ def patch_decode_cuda_graph_current_pages_triton(
 
     if page_block_idx == 0:
         tl.store(cache_seqlens_ptr + req_idx, tl.where(valid, cache_len, FILL_VALUE))
-        current_page = (out_cache_loc // PAGE_SIZE).to(tl.int32)
+        raw_valid = out_cache_loc >= 0
+        current_page_i64 = tl.where(raw_valid, out_cache_loc // PAGE_SIZE, 0)
+        current_page_valid = raw_valid & (current_page_i64 >= 0) & (current_page_i64 < NUM_CACHE_PAGES)
+        safe_current_page = tl.where(current_page_valid, current_page_i64, -1).to(tl.int32)
         tl.store(
             page_table_ptr + req_idx * page_table_row_stride + logical_page,
-            current_page,
+            safe_current_page,
             mask=valid,
         )
         if HAS_SWA:
@@ -158,9 +173,13 @@ def patch_decode_cuda_graph_current_pages_triton(
                 out_cache_loc_swa = tl.load(swa_index_mapping_ptr + swa_mapping_idx).to(
                     tl.int64
                 )
+            swa_raw_valid = out_cache_loc_swa >= 0
+            swa_page_id_i64 = tl.where(swa_raw_valid, out_cache_loc_swa // PAGE_SIZE, 0)
+            swa_page_valid = swa_raw_valid & (swa_page_id_i64 >= 0) & (swa_page_id_i64 < NUM_CACHE_PAGES)
+            safe_swa_page_id = tl.where(swa_page_valid, swa_page_id_i64, -1).to(tl.int32)
             tl.store(
                 swa_page_table_ptr + req_idx * swa_page_table_row_stride + logical_page,
-                (out_cache_loc_swa // PAGE_SIZE).to(tl.int32),
+                safe_swa_page_id,
                 mask=valid,
             )
 
@@ -175,6 +194,7 @@ def build_decode_graph_page_table_full_triton(
     page_table_row_stride,
     PAGE_SIZE: tl.constexpr,
     MAX_PAGES: tl.constexpr,
+    NUM_CACHE_PAGES: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
     req_idx = tl.program_id(axis=0)
@@ -193,9 +213,15 @@ def build_decode_graph_page_table_full_triton(
     token_indices = tl.load(
         req_to_token_ptr + flat_token_offsets, mask=page_mask, other=0
     )
+    # Validate raw source before division; check quotient in Int64.
+    # Use sentinel -1 for invalid so the kernel clamp treats it as invalid.
+    raw_valid = token_indices >= 0
+    page_ids_i64 = tl.where(raw_valid, token_indices // PAGE_SIZE, 0)
+    page_valid = raw_valid & (page_ids_i64 >= 0) & (page_ids_i64 < NUM_CACHE_PAGES)
+    safe_page_ids = tl.where(page_valid, page_ids_i64, -1).to(tl.int32)
     tl.store(
         page_table_ptr + req_idx * page_table_row_stride + page_offsets,
-        (token_indices // PAGE_SIZE).to(tl.int32),
+        safe_page_ids,
         mask=page_mask,
     )
 
@@ -957,6 +983,7 @@ def stage_decode_cuda_graph_metadata(
     cu_seqlens_q: torch.Tensor,
     page_table: torch.Tensor,
     page_size: int,
+    num_cache_pages: int,
     swa_page_table: torch.Tensor | None = None,
     swa_index_mapping: torch.Tensor | None = None,
 ) -> None:
@@ -1026,6 +1053,7 @@ def stage_decode_cuda_graph_metadata(
         PAGE_SIZE=page_size,
         BATCH=bs,
         MAX_PAGES=max_pages,
+        NUM_CACHE_PAGES=num_cache_pages,
         HAS_SWA=has_swa,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
     )
@@ -1038,6 +1066,7 @@ def patch_decode_cuda_graph_current_pages(
     out_cache_loc: torch.Tensor,
     page_size: int,
     fill_value: int = 1,
+    num_cache_pages: int,
     swa_page_table: torch.Tensor | None = None,
     out_cache_loc_swa: torch.Tensor | None = None,
     swa_index_mapping: torch.Tensor | None = None,
@@ -1105,6 +1134,7 @@ def patch_decode_cuda_graph_current_pages(
         PAGE_SIZE=page_size,
         FILL_VALUE=int(fill_value),
         MAX_PAGES=max_pages,
+        NUM_CACHE_PAGES=num_cache_pages,
         HAS_SWA=has_swa,
         HAS_OUT_CACHE_LOC_SWA=has_out_cache_loc_swa,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
@@ -1124,6 +1154,7 @@ def update_decode_graph_chunk_metadata_fused(
     kv_window_start_tokens: torch.Tensor,
     decode_chunk_pages_lut: torch.Tensor,
     page_size: int,
+    num_cache_pages: int,
     window_page_span: int = 0,
     window_left: int = -1,
     max_q_tiles_per_req: int = 1,
@@ -1251,6 +1282,7 @@ def update_decode_graph_replay_metadata(
     kv_chunk_size_ptr: torch.Tensor,
     kv_window_start_tokens: torch.Tensor,
     decode_chunk_pages_lut: torch.Tensor,
+    num_cache_pages: int,
     page_size: int,
     window_page_span: int = 0,
     window_left: int = -1,
@@ -1315,6 +1347,7 @@ def update_decode_graph_replay_metadata(
         page_table.stride(0),
         PAGE_SIZE=page_size,
         MAX_PAGES=int(page_table.shape[1]),
+        NUM_CACHE_PAGES=num_cache_pages,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
     )
 
@@ -1349,6 +1382,7 @@ def update_msa_decode_graph_chunk_metadata(
     kv_window_start_tokens: torch.Tensor,
     kv_chunk_size: int,
     page_size: int,
+    num_cache_pages: int,
 ) -> None:
     device = cache_seqlens.device
     if request_indices.device != device:
@@ -1461,6 +1495,7 @@ def update_msa_decode_graph_replay_metadata(
     block_valid_mask: torch.Tensor,
     kv_chunk_size_ptr: torch.Tensor,
     kv_window_start_tokens: torch.Tensor,
+    num_cache_pages: int,
     kv_chunk_size: int,
     page_size: int,
 ) -> None:
@@ -1491,6 +1526,7 @@ def update_msa_decode_graph_replay_metadata(
         page_table.stride(0),
         PAGE_SIZE=page_size,
         MAX_PAGES=int(page_table.shape[1]),
+        NUM_CACHE_PAGES=num_cache_pages,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
     )
     update_msa_decode_graph_chunk_metadata(
@@ -1520,6 +1556,7 @@ def update_regular_decode_graph_replay_metadata(
     kv_window_start_tokens: torch.Tensor,
     decode_chunk_pages_lut: torch.Tensor,
     page_size: int,
+    num_cache_pages: int,
     window_page_span: int = 0,
     window_left: int = -1,
 ) -> None:
@@ -1552,6 +1589,7 @@ def update_regular_decode_graph_replay_metadata(
         page_table.stride(0),
         PAGE_SIZE=page_size,
         MAX_PAGES=int(page_table.shape[1]),
+        NUM_CACHE_PAGES=num_cache_pages,
         BLOCK_PAGES=_DECODE_BLOCK_PAGES,
     )
 

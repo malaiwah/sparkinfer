@@ -1799,6 +1799,28 @@ def create_paged_plan(
     if any(cache_pages > max_pages_per_request for cache_pages in cache_pages_arr):
         raise ValueError("page_table width is smaller than required by cache_seqlens")
 
+    # Host-side defense: verify that active page-table entries are within
+    # physical KV-cache capacity.  Only the first cache_pages_arr[i] entries
+    # per request are active; padded entries beyond that are inactive and
+    # not checked.  The kernel also clamps each page_id at runtime (sink-local
+    # predication with zero-fill), so graph-replay mutation after plan
+    # creation cannot bypass the bound.  This host check catches caller bugs
+    # early on the non-graph path.
+    num_cache_pages = min(num_pages, v_num_pages)
+    _page_table_cpu = page_table.to(torch.int64)
+    _invalid_count = 0
+    for _req_idx, _req_pages in enumerate(cache_pages_arr):
+        if _req_pages == 0:
+            continue
+        _active = _page_table_cpu[_req_idx, :_req_pages]
+        _invalid = (_active < 0) | (_active >= num_cache_pages)
+        _invalid_count += int(_invalid.sum())
+    if _invalid_count > 0:
+        raise ValueError(
+            f"page_table contains page ids outside physical KV-cache capacity "
+            f"[0, {num_cache_pages}): found {_invalid_count} invalid entries"
+        )
+
     inferred_mode = infer_paged_mode(cu_seqlens_q)
     mode = inferred_mode if mode is None else mode
     if msa_union_tile is None:

@@ -314,6 +314,7 @@ def _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
     request_idx,
     tile_token_base,
     page_size,
+    num_cache_pages,
 ):
     page_idx = tile_token_base // page_size
     page_row_offset = tile_token_base - page_idx * page_size
@@ -324,38 +325,39 @@ def _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
         )
         else mPageTable[request_idx, page_idx]
     )
-    # Page ids are allocator-owned pool coordinates.  Widen before scaling so
-    # high recycled ids cannot overflow even when every individual tensor
-    # extent still fits in Int32.
+    # Bound page_id to physical KV-cache capacity before forming any address.
+    page_id_valid = (page_id >= Int32(0)) and (page_id < num_cache_pages)
+    page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
     page_row_base = Int64(page_id) * Int64(page_size) + Int64(page_row_offset)
     desc_ptr = Int64(mDescPtrsFlat[kv_head_idx])
     full_mbar_ptr = mbar_ptr + producer_state.index
     with cute.arch.elect_one():
         cute.arch.mbarrier_arrive_and_expect_tx(
             full_mbar_ptr,
-            expected_bytes,
+            cutlass.select_(page_id_valid, expected_bytes, Int32(0)),
         )
-        tma_bar_addr = shared_ptr_to_u32(full_mbar_ptr)
-        plane0_dst = shared_ptr_to_u32(
-            sStageBytes.iterator + stage_plane_offset + Int32(0 * kv_plane_total_bytes)
-        )
-        plane1_dst = shared_ptr_to_u32(
-            sStageBytes.iterator + stage_plane_offset + Int32(1 * kv_plane_total_bytes)
-        )
-        _cp_async_bulk_tensor_2d(
-            plane0_dst,
-            desc_ptr,
-            Int32(0),
-            page_row_base,
-            tma_bar_addr,
-        )
-        _cp_async_bulk_tensor_2d(
-            plane1_dst,
-            desc_ptr,
-            Int32(kv_tma_plane_head_dim),
-            page_row_base,
-            tma_bar_addr,
-        )
+        if page_id_valid:
+            tma_bar_addr = shared_ptr_to_u32(full_mbar_ptr)
+            plane0_dst = shared_ptr_to_u32(
+                sStageBytes.iterator + stage_plane_offset + Int32(0 * kv_plane_total_bytes)
+            )
+            plane1_dst = shared_ptr_to_u32(
+                sStageBytes.iterator + stage_plane_offset + Int32(1 * kv_plane_total_bytes)
+            )
+            _cp_async_bulk_tensor_2d(
+                plane0_dst,
+                desc_ptr,
+                Int32(0),
+                page_row_base,
+                tma_bar_addr,
+            )
+            _cp_async_bulk_tensor_2d(
+                plane1_dst,
+                desc_ptr,
+                Int32(kv_tma_plane_head_dim),
+                page_row_base,
+                tma_bar_addr,
+            )
 
 
 @cute.jit
@@ -3505,6 +3507,7 @@ class PagedForwardKernel:
         warp_linear_idx,
         valid_rows,
         upcast_stride,
+        num_cache_pages,
         fill_zero: cutlass.Constexpr,
     ):
         page_size = Int32(self.page_size)
@@ -3537,6 +3540,12 @@ class PagedForwardKernel:
                     else token_idx - page_iter * page_size
                 )
             page_id = mPageTable[request_idx, page_iter]
+            # Bound page_id to physical KV-cache capacity.  An out-of-range
+            # id is clamped to page 0 for safe address formation, but the
+            # load is zero-filled / predicated off so invalid page data never
+            # aliases real KV content.
+            page_id_valid = (page_id >= Int32(0)) and (page_id < num_cache_pages)
+            page_id = cutlass.select_(page_id_valid, page_id, Int32(0))
             row_valid = row_idx < valid_rows
             row_byte_base = (
                 (
@@ -3558,7 +3567,7 @@ class PagedForwardKernel:
                     stage_byte_offset
                     + _permuted_offset_128b(row_idx, vec_idx, upcast_stride) * 16
                 )
-                vec_valid = row_valid and (vec_idx * Int32(16) < row_bytes)
+                vec_valid = row_valid and page_id_valid and (vec_idx * Int32(16) < row_bytes)
                 if const_expr(fill_zero):
                     _cp_async_load_128b_zfill(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
@@ -3566,10 +3575,12 @@ class PagedForwardKernel:
                         cutlass.select_(vec_valid, Int32(16), Int32(0)),
                     )
                 else:
-                    _cp_async_load_128b_pred(
+                    # Use zfill for both valid and invalid: when vec_valid is
+                    # false, src_bytes=0 zero-fills instead of leaving stale SMEM.
+                    _cp_async_load_128b_zfill(
                         shared_ptr_to_u32(sStageBytes.iterator + dst_byte_idx),
                         get_ptr_as_int64(mCacheBytes, src_byte_idx),
-                        Int32(vec_valid),
+                        cutlass.select_(vec_valid, Int32(16), Int32(0)),
                     )
 
     @cute.jit
@@ -3585,6 +3596,7 @@ class PagedForwardKernel:
         request_idx,
         tile_token_base,
         page_size,
+        num_cache_pages,
     ):
         page_idx = tile_token_base // page_size
         page_id = (
@@ -3594,6 +3606,11 @@ class PagedForwardKernel:
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
+        )
+        page_id = cutlass.select_(
+            (page_id >= Int32(0)) and (page_id < num_cache_pages),
+            page_id,
+            Int32(0),
         )
         pipeline_tma.producer_acquire(producer_state)
         load_tma0(src_idx=page_id, producer_state=producer_state)
@@ -3612,6 +3629,7 @@ class PagedForwardKernel:
         request_idx,
         tile_token_base,
         page_size,
+        num_cache_pages,
     ):
         page_idx = tile_token_base // page_size
         page_id = (
@@ -3621,6 +3639,11 @@ class PagedForwardKernel:
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
+        )
+        page_id = cutlass.select_(
+            (page_id >= Int32(0)) and (page_id < num_cache_pages),
+            page_id,
+            Int32(0),
         )
         pipeline_tma.producer_acquire(producer_state)
         load_tma0(src_idx=page_id, producer_state=producer_state)
@@ -3641,6 +3664,7 @@ class PagedForwardKernel:
         request_idx,
         tile_token_base,
         page_size,
+        num_cache_pages,
     ):
         _issue_paged_kv_tma_copy_2planes_fp8_raw_impl(
             mDescPtrsFlat,
@@ -3656,6 +3680,7 @@ class PagedForwardKernel:
             request_idx,
             tile_token_base,
             page_size,
+            num_cache_pages,
         )
 
     @cute.jit
@@ -3985,6 +4010,12 @@ class PagedForwardKernel:
         tma_atom_K: cute.CopyAtom | None,
         tma_atom_V: cute.CopyAtom | None,
     ):
+        # Physical KV-cache page capacity for sink-local page_id bounding.
+        num_cache_pages = cutlass.select_(
+            mKCache.shape[0] < mVCache.shape[0],
+            Int32(mKCache.shape[0]),
+            Int32(mVCache.shape[0]),
+        )
         lane, warp_q_idx, warp_kv_idx = cute.arch.thread_idx()
         work_idx, kv_head_idx, _ = cute.arch.block_idx()
         block_valid = mBlockValidMask[work_idx]
@@ -5066,6 +5097,7 @@ class PagedForwardKernel:
                                 request_idx,
                                 prefetch_base,
                                 page_size,
+                                num_cache_pages,
                             )
                         elif const_expr(self.kv_tma_plane_count > 2):
                             self._issue_paged_kv_tma_copy_planes(
@@ -5079,6 +5111,7 @@ class PagedForwardKernel:
                                 request_idx,
                                 prefetch_base,
                                 page_size,
+                                num_cache_pages,
                             )
                         else:
                             self._issue_paged_kv_tma_copy_2planes(
@@ -5090,6 +5123,7 @@ class PagedForwardKernel:
                                 request_idx,
                                 prefetch_base,
                                 page_size,
+                                num_cache_pages,
                             )
                     if const_expr(self.use_paged_v_tma):
                         if const_expr(self.use_paged_kv_tma_fp8_raw_issue):
@@ -5106,6 +5140,7 @@ class PagedForwardKernel:
                                 request_idx,
                                 prefetch_base,
                                 page_size,
+                                num_cache_pages,
                             )
                         elif const_expr(self.kv_tma_plane_count > 2):
                             self._issue_paged_kv_tma_copy_planes(
@@ -5119,6 +5154,7 @@ class PagedForwardKernel:
                                 request_idx,
                                 prefetch_base,
                                 page_size,
+                                num_cache_pages,
                             )
                         else:
                             self._issue_paged_kv_tma_copy_2planes(
@@ -5130,6 +5166,7 @@ class PagedForwardKernel:
                                 request_idx,
                                 prefetch_base,
                                 page_size,
+                                num_cache_pages,
                             )
                 if const_expr(not self.use_paged_k_tma):
                     self._async_copy_paged_tile_permuted_128b(
@@ -5150,6 +5187,7 @@ class PagedForwardKernel:
                         warp_linear_idx,
                         tile_tokens,
                         self.traits.upcast_stride_k,
+                        num_cache_pages,
                         False,
                     )
                     cute.arch.cp_async_commit_group()
@@ -5172,6 +5210,7 @@ class PagedForwardKernel:
                         warp_linear_idx,
                         tile_tokens,
                         self.traits.upcast_stride_v,
+                        num_cache_pages,
                         True,
                     )
                     cute.arch.cp_async_commit_group()
@@ -5213,6 +5252,7 @@ class PagedForwardKernel:
                     warp_linear_idx,
                     tile_tokens,
                     self.traits.upcast_stride_k,
+                    num_cache_pages,
                     False,
                 )
                 cute.arch.cp_async_commit_group()
@@ -5234,6 +5274,7 @@ class PagedForwardKernel:
                     warp_linear_idx,
                     tile_tokens,
                     self.traits.upcast_stride_v,
+                    num_cache_pages,
                     True,
                 )
                 cute.arch.cp_async_commit_group()
@@ -6082,6 +6123,7 @@ class PagedForwardKernel:
                                 warp_linear_idx,
                                 next_tile_tokens,
                                 self.traits.upcast_stride_k,
+                                num_cache_pages,
                                 False,
                             )
                             cute.arch.cp_async_commit_group()
@@ -6122,6 +6164,7 @@ class PagedForwardKernel:
                                 warp_linear_idx,
                                 next_tile_tokens,
                                 self.traits.upcast_stride_k,
+                                num_cache_pages,
                                 False,
                             )
                             cute.arch.cp_async_commit_group()
@@ -6484,6 +6527,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_tile_base,
                                         page_size,
+                                        num_cache_pages,
                                     )
                                 elif const_expr(self.kv_tma_plane_count > 2):
                                     self._issue_paged_kv_tma_copy_planes(
@@ -6497,6 +6541,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_tile_base,
                                         page_size,
+                                        num_cache_pages,
                                     )
                                 else:
                                     self._issue_paged_kv_tma_copy_2planes(
@@ -6508,6 +6553,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_tile_base,
                                         page_size,
+                                        num_cache_pages,
                                     )
                             if const_expr(self.use_paged_v_tma):
                                 if const_expr(self.use_paged_kv_tma_fp8_raw_issue):
@@ -6524,6 +6570,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_tile_base,
                                         page_size,
+                                        num_cache_pages,
                                     )
                                 elif const_expr(self.kv_tma_plane_count > 2):
                                     self._issue_paged_kv_tma_copy_planes(
@@ -6537,6 +6584,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_tile_base,
                                         page_size,
+                                        num_cache_pages,
                                     )
                                 else:
                                     self._issue_paged_kv_tma_copy_2planes(
@@ -6548,6 +6596,7 @@ class PagedForwardKernel:
                                         request_idx,
                                         next_tile_base,
                                         page_size,
+                                        num_cache_pages,
                                     )
                         if const_expr(not self.use_paged_k_tma):
                             self._async_copy_paged_tile_permuted_128b(
@@ -6568,6 +6617,7 @@ class PagedForwardKernel:
                                 warp_linear_idx,
                                 next_tile_tokens,
                                 self.traits.upcast_stride_k,
+                                num_cache_pages,
                                 False,
                             )
                             cute.arch.cp_async_commit_group()
@@ -6590,6 +6640,7 @@ class PagedForwardKernel:
                                 warp_linear_idx,
                                 next_tile_tokens,
                                 self.traits.upcast_stride_v,
+                                num_cache_pages,
                                 True,
                             )
                             cute.arch.cp_async_commit_group()
@@ -6615,6 +6666,7 @@ class PagedForwardKernel:
                             warp_linear_idx,
                             next_tile_tokens,
                             self.traits.upcast_stride_v,
+                            num_cache_pages,
                             True,
                         )
                         cute.arch.cp_async_commit_group()
@@ -6639,6 +6691,7 @@ class PagedForwardKernel:
                             warp_linear_idx,
                             next_tile_tokens,
                             self.traits.upcast_stride_v,
+                            num_cache_pages,
                             True,
                         )
                         cute.arch.cp_async_commit_group()

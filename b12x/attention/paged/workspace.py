@@ -1534,6 +1534,7 @@ class PagedAttentionWorkspace:
                 self.page_table.stride(0),
                 PAGE_SIZE=self.page_size,
                 MAX_PAGES=int(self.page_table.shape[1]),
+                NUM_CACHE_PAGES=int(self._plan_k_cache.shape[0]) if self._plan_k_cache is not None else 1,
                 BLOCK_PAGES=_DECODE_BLOCK_PAGES,
             )
             update_regular_decode_graph_chunk_metadata(
@@ -1562,6 +1563,7 @@ class PagedAttentionWorkspace:
                 kv_window_start_tokens=self.kv_window_start_tokens,
                 decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
                 page_size=self.page_size,
+                num_cache_pages=int(self._plan_k_cache.shape[0]) if self._plan_k_cache is not None else 1,
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
             )
@@ -1583,6 +1585,7 @@ class PagedAttentionWorkspace:
                 kv_window_start_tokens=self.kv_window_start_tokens,
                 decode_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
                 page_size=self.page_size,
+                num_cache_pages=int(self._plan_k_cache.shape[0]) if self._plan_k_cache is not None else 1,
                 window_page_span=window_page_span,
                 window_left=int(self._plan.window_left),
                 max_q_tiles_per_req=int(
