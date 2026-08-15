@@ -10,6 +10,10 @@ import cutlass.cute as cute
 import torch
 
 from b12x._lib.dense_gemm import dense_gemm
+from b12x._lib.utils import (
+    record_tensors_on_current_stream,
+    validate_stream_int_is_current,
+)
 
 from b12x.gemm._shared.wo_mxfp8 import (
     MXFP8_SCALE_K_TILE,
@@ -600,24 +604,22 @@ def tensor_fp8_linear(
         device_ctx = nullcontext()
         stream_ctx = nullcontext()
 
-    # Record caller-owned tensors on the target stream so the caching
-    # allocator does not recycle their memory while the raw GEMM launch
-    # (which reads them via raw pointers on target_stream) is still in
-    # flight.  Tensors allocated inside the stream context below
-    # (source_2d, padded source) are already on the target stream.  The
-    # cached unit-scale tensor is process-lifetime stable.
     if target_stream is not None:
         current_stream = torch.cuda.current_stream(device)
         if target_stream != current_stream:
             target_stream.wait_stream(current_stream)
-        source.record_stream(target_stream)
-        packed_weight.values.record_stream(target_stream)
-        packed_weight.scale_mma.record_stream(target_stream)
-        packed_weight.output_scale.record_stream(target_stream)
-        if bias is not None:
-            bias.record_stream(target_stream)
 
     with device_ctx, stream_ctx:
+        record_tensors_on_current_stream(
+            [
+                source,
+                packed_weight.values,
+                packed_weight.scale_mma,
+                packed_weight.output_scale,
+                bias,
+            ],
+            device,
+        )
         source_2d = _source_2d(source)
         tokens, in_features = map(int, source_2d.shape)
         if source_2d.dtype != torch.float8_e4m3fn:

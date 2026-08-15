@@ -296,7 +296,7 @@ def test_topology_record_structure():
 def test_verify_topology_rejects_duplicate_gpu(monkeypatch):
     record_a = (0, "host", "GPU-uuid-0")
     record_b = (1, "host", "GPU-uuid-0")
-    monkeypatch.setattr(_topk_mod, "_broadcast_gather_object", lambda obj, group: [record_a, record_b])
+    monkeypatch.setattr(_topk_mod, "_exchange_topology_records", lambda obj, group: [record_a, record_b])
     with pytest.raises(RuntimeError, match="duplicate GPU UUID"):
         _verify_dcp_topk_topology(exchange_group=object(), topology=record_a)
 
@@ -304,7 +304,7 @@ def test_verify_topology_rejects_duplicate_gpu(monkeypatch):
 def test_verify_topology_rejects_multi_host(monkeypatch):
     record_a = (0, "host-a", "GPU-uuid-0")
     record_b = (1, "host-b", "GPU-uuid-1")
-    monkeypatch.setattr(_topk_mod, "_broadcast_gather_object", lambda obj, group: [record_a, record_b])
+    monkeypatch.setattr(_topk_mod, "_exchange_topology_records", lambda obj, group: [record_a, record_b])
     with pytest.raises(RuntimeError, match="multiple hosts"):
         _verify_dcp_topk_topology(exchange_group=object(), topology=record_a)
 
@@ -312,7 +312,7 @@ def test_verify_topology_rejects_multi_host(monkeypatch):
 def test_verify_topology_rejects_empty_uuid(monkeypatch):
     record_a = (0, "host", "")
     record_b = (1, "host", "GPU-uuid-1")
-    monkeypatch.setattr(_topk_mod, "_broadcast_gather_object", lambda obj, group: [record_a, record_b])
+    monkeypatch.setattr(_topk_mod, "_exchange_topology_records", lambda obj, group: [record_a, record_b])
     with pytest.raises(RuntimeError, match="UUID"):
         _verify_dcp_topk_topology(exchange_group=object(), topology=record_a)
 
@@ -320,7 +320,7 @@ def test_verify_topology_rejects_empty_uuid(monkeypatch):
 def test_verify_topology_rejects_noncontiguous_ranks(monkeypatch):
     record_a = (0, "host", "GPU-uuid-0")
     record_b = (2, "host", "GPU-uuid-1")
-    monkeypatch.setattr(_topk_mod, "_broadcast_gather_object", lambda obj, group: [record_a, record_b])
+    monkeypatch.setattr(_topk_mod, "_exchange_topology_records", lambda obj, group: [record_a, record_b])
     with pytest.raises(RuntimeError, match="contiguous"):
         _verify_dcp_topk_topology(exchange_group=object(), topology=record_a)
 
@@ -328,36 +328,39 @@ def test_verify_topology_rejects_noncontiguous_ranks(monkeypatch):
 def test_verify_topology_accepts_unique(monkeypatch):
     record_a = (0, "host", "GPU-uuid-0")
     record_b = (1, "host", "GPU-uuid-1")
-    monkeypatch.setattr(_topk_mod, "_broadcast_gather_object", lambda obj, group: [record_a, record_b])
+    monkeypatch.setattr(_topk_mod, "_exchange_topology_records", lambda obj, group: [record_a, record_b])
     _verify_dcp_topk_topology(exchange_group=object(), topology=record_a)
 
 
-def test_require_collective_contract_rejects_mismatch(monkeypatch):
-    """Exercise the actual _require_collective_contract production gate."""
+def test_require_dcp_topk_contract_rejects_mismatch(monkeypatch):
+    """Exercise the DCP Top-K typed contract fingerprint gate."""
     canonical = _base_contract()
     mismatched = _mismatched_contract("capacity_max_rows")
     monkeypatch.setattr(
         _topk_mod,
-        "_broadcast_gather_object",
-        lambda contract, group: [contract, mismatched],
+        "_exchange_int_contract",
+        lambda fields, group: [
+            list(fields),
+            list(_topk_mod._contract_fingerprint(mismatched)),
+        ],
     )
     with pytest.raises(RuntimeError, match="contract differs across ranks"):
-        _topk_mod._require_collective_contract(
+        _topk_mod._require_dcp_topk_contract(
             owner="test",
             exchange_group=object(),
             contract=canonical,
         )
 
 
-def test_require_collective_contract_accepts_match(monkeypatch):
-    """Exact match must pass the production gate."""
+def test_require_dcp_topk_contract_accepts_match(monkeypatch):
+    """Exact contract fingerprints must pass the production gate."""
     canonical = _base_contract()
     monkeypatch.setattr(
         _topk_mod,
-        "_broadcast_gather_object",
-        lambda contract, group: [contract, contract],
+        "_exchange_int_contract",
+        lambda fields, group: [list(fields), list(fields)],
     )
-    _topk_mod._require_collective_contract(
+    _topk_mod._require_dcp_topk_contract(
         owner="test",
         exchange_group=object(),
         contract=canonical,

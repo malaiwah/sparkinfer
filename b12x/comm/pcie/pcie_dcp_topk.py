@@ -1,6 +1,8 @@
 """Exact owner-sharded PCIe transport for DCP sparse top-k."""
 
 from __future__ import annotations
+import hashlib
+import json
 
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -22,7 +24,8 @@ from .pcie_oneshot import (
     IPC_SLAB_ALIGNMENT,
     PCIeOneshotAllReduce,
     _align_up,
-    _broadcast_gather_object,
+    _exchange_int_contract,
+    _exchange_status_strings,
     _coordinated_close_channels,
     _current_stream_key,
     _device_guard,
@@ -30,7 +33,6 @@ from .pcie_oneshot import (
     _is_current_stream_capturing,
     _normalize_device,
     _OwnedSharedBuffer,
-    _require_collective_contract,
     _require_full_grid_residency,
     _run_collective_preallocation_setup,
 )
@@ -86,11 +88,55 @@ def _dcp_topk_topology_record(*, rank: int, device: torch.device) -> tuple:
     return (int(rank), host_id, device_uuid)
 
 
+def _exchange_topology_records(
+    topology: tuple[int, str, str], exchange_group: ProcessGroup
+) -> list[tuple[int, str, str]]:
+    ranks = _exchange_int_contract((int(topology[0]),), exchange_group)
+    identities = _exchange_status_strings(
+        (str(topology[1]), str(topology[2])), exchange_group
+    )
+    if len(ranks) != len(identities):
+        raise RuntimeError("DCP top-k topology exchange returned inconsistent rank counts")
+    return [
+        (int(rank_fields[0]), identity_fields[0], identity_fields[1])
+        for rank_fields, identity_fields in zip(ranks, identities)
+    ]
+
+
+def _exchange_launch_contract(
+    contract: tuple[bool, int, int, int, bool],
+    exchange_group: ProcessGroup,
+) -> list[tuple[bool, int, int, int, bool]]:
+    gathered = _exchange_int_contract(
+        tuple(int(value) for value in contract), exchange_group
+    )
+    return [
+        (bool(fields[0]), int(fields[1]), int(fields[2]), int(fields[3]), bool(fields[4]))
+        for fields in gathered
+    ]
+
+
+def _exchange_capture_status(
+    status: tuple[bool, str, int],
+    exchange_group: ProcessGroup,
+) -> list[tuple[bool, str, int]]:
+    status_fields = _exchange_int_contract(
+        (int(status[0]), int(status[2])), exchange_group
+    )
+    errors = _exchange_status_strings((status[1],), exchange_group)
+    if len(status_fields) != len(errors):
+        raise RuntimeError("DCP top-k status exchange returned inconsistent rank counts")
+    return [
+        (bool(fields[0]), error_fields[0], int(fields[1]))
+        for fields, error_fields in zip(status_fields, errors)
+    ]
+
+
 def _verify_dcp_topk_topology(
     *, exchange_group: ProcessGroup, topology: tuple
 ) -> None:
     """Collectively verify topology uniqueness and IPC reachability."""
-    gathered = _broadcast_gather_object(topology, exchange_group)
+    gathered = _exchange_topology_records(topology, exchange_group)
     if len(gathered) < 2:
         return
     host_ids = {record[1] for record in gathered}
@@ -201,6 +247,29 @@ def _dcp_topk_runtime_contract(
         True,
         IPC_SLAB_ALIGNMENT,
     )
+
+
+def _contract_fingerprint(contract: tuple) -> tuple[int, int, int, int]:
+    encoded = json.dumps(
+        contract,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    digest = hashlib.sha256(encoded).digest()
+    return tuple(
+        int.from_bytes(digest[offset : offset + 8], "little", signed=True)
+        for offset in range(0, len(digest), 8)
+    )
+
+
+def _require_dcp_topk_contract(
+    *, owner: str, exchange_group: ProcessGroup, contract: tuple
+) -> None:
+    fingerprint = _contract_fingerprint(contract)
+    gathered = _exchange_int_contract(fingerprint, exchange_group)
+    local_fields = list(fingerprint)
+    if any(peer != local_fields for peer in gathered):
+        raise RuntimeError(f"{owner} contract differs across ranks: {gathered}")
 
 
 def _tensor_from_cuda_pointer(
@@ -543,7 +612,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
         ipc, layout, contract = _run_collective_preallocation_setup(
             owner="PCIe DCP top-k", exchange_group=exchange_group, setup=prepare,
         )
-        _require_collective_contract(
+        _require_dcp_topk_contract(
             owner="PCIe DCP top-k channel layout",
             exchange_group=exchange_group,
             contract=contract,
@@ -706,7 +775,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                 wait_for_prior_consumer,
             )
             if self.exchange_group is not None:
-                gathered = _broadcast_gather_object(
+                gathered = _exchange_launch_contract(
                     capture_contract, self.exchange_group
                 )
                 if any(peer != capture_contract for peer in gathered):
@@ -742,7 +811,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
                         type(capture_body_error).__name__ if capture_body_error else "",
                         stage_count,
                     )
-                    gathered = _broadcast_gather_object(
+                    gathered = _exchange_capture_status(
                         status, self.exchange_group
                     )
                     if any(peer[0] is not True for peer in gathered):
@@ -779,7 +848,7 @@ class PCIeDCPTopKOwnerExchange(_IPCChannel):
             int(rows), int(blocks), int(slot),
             bool(wait_for_prior_consumer),
         )
-        gathered = _broadcast_gather_object(
+        gathered = _exchange_launch_contract(
             prelaunch_contract, self.exchange_group
         )
         if any(peer != prelaunch_contract for peer in gathered):

@@ -448,9 +448,12 @@ def _install_fake_external_binary_module(monkeypatch, fake_cls):
             monkeypatch.setitem(
                 sys.modules, mod_name, types.ModuleType(mod_name)
             )
-    sys.modules[
-        "cutlass.base_dsl.export.external_binary_module"
-    ].ExternalBinaryModule = fake_cls
+    monkeypatch.setattr(
+        sys.modules["cutlass.base_dsl.export.external_binary_module"],
+        "ExternalBinaryModule",
+        fake_cls,
+        raising=False,
+    )
 
 
 def _make_full_manifest(cache_key, payload, func, object_bytes):

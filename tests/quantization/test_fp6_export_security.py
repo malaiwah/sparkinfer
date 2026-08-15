@@ -18,6 +18,7 @@ They run without CUDA by stubbing the heavy kernel modules.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import pathlib
@@ -27,6 +28,16 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+for _real_mod in (
+    "b12x._lib.fp6",
+    "b12x._lib.utils",
+    "b12x.quantization.mxfp6",
+):
+    try:
+        importlib.import_module(_real_mod)
+    except ImportError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Stub heavy CUDA / CUTLASS dependencies so the export module can import on CPU.
@@ -118,12 +129,14 @@ def _pack_codes_stub(codes: torch.Tensor) -> torch.Tensor:
 
 
 _fp6_stub.pack_fp6_codes_tensor = _pack_codes_stub
-sys.modules["b12x._lib.fp6"] = _fp6_stub
+if "b12x._lib.fp6" not in sys.modules:
+    sys.modules["b12x._lib.fp6"] = _fp6_stub
 
 _utils_stub = MagicMock()
 _utils_stub.MXFP6_SF_VEC_SIZE = 32
 _utils_stub.mxfp6_packed_k_bytes = lambda k: 3 * k // 4
-sys.modules["b12x._lib.utils"] = _utils_stub
+if "b12x._lib.utils" not in sys.modules:
+    sys.modules["b12x._lib.utils"] = _utils_stub
 
 for _mod in ["cuda", "cuda.bindings", "cuda.bindings.driver"]:
     if _mod not in sys.modules:
@@ -140,6 +153,7 @@ safetensors_torch = pytest.importorskip("safetensors.torch")
 
 from b12x.quantization.mxfp6.fp6_safetensors_export import (  # noqa: E402
     _SecureExportContext,
+    UnsafeAuxiliaryFileError,
     dequantize_fp6_checkpoint_to_bf16,
     export_dense_model_to_fp6_safetensors,
     export_moe_model_to_fp6_safetensors,
@@ -676,15 +690,20 @@ class TestAdversarialRaces:
         assert call_count[0] > 1
 
     def test_aux_symlink_not_followed(self, tmp_path: pathlib.Path) -> None:
-        """A symlinked aux file in the source must not be copied."""
+        """A symlinked aux file fails closed without publishing output."""
         _fake_dense(tmp_path / "d")
         victim = tmp_path / "secret.txt"
         victim.write_text("secret data")
         (tmp_path / "d" / "tokenizer_config.json").symlink_to(victim)
         safe = _safe_parent(tmp_path)
         out = safe / "out"
-        export_dense_model_to_fp6_safetensors(tmp_path / "d", out, device="cpu", use_gpu=False, verbose=False)
-        assert not (out / "tokenizer_config.json").exists()
+        with pytest.raises(UnsafeAuxiliaryFileError, match="auxiliary symlink"):
+            export_dense_model_to_fp6_safetensors(
+                tmp_path / "d", out, device="cpu", use_gpu=False, verbose=False
+            )
+        assert victim.read_text() == "secret data"
+        assert not out.exists()
+        assert not any(p.name.startswith(".b12x-staging") for p in safe.iterdir())
 
     def test_publish_failure_cleans_staging(self, tmp_path: pathlib.Path) -> None:
         """If the no-replace rename fails, the staging dir must be cleaned."""

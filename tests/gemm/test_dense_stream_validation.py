@@ -657,15 +657,8 @@ def test_mxfp8_linear_rejects_non_current_stream(monkeypatch) -> None:
         )
 
 
-def test_tensor_fp8_linear_rejects_non_current_stream(monkeypatch) -> None:
-    """tensor_fp8_linear validates stream before padding or GEMM."""
-    fake_current = _FakeStream(handle=42, device_index=0)
-    fake_other = _FakeStream(handle=99, device_index=0)
-
-    monkeypatch.setattr(
-        torch.cuda, "current_stream", lambda dev: fake_current
-    )
-
+def test_tensor_fp8_linear_rejects_raw_stream_handle() -> None:
+    """tensor_fp8_linear rejects unvalidated raw handles before tensor work."""
     source = torch.empty(1, 128, dtype=torch.float8_e4m3fn, device="cuda")
 
     from b12x.gemm.tensor_fp8_linear._kernel import (
@@ -677,9 +670,9 @@ def test_tensor_fp8_linear_rejects_non_current_stream(monkeypatch) -> None:
         def __init__(self):
             pass
 
-    with pytest.raises(ValueError, match="must be the current stream"):
+    with pytest.raises(TypeError, match="stream must be a torch.cuda.Stream"):
         tensor_fp8_linear(
             source=source,
             packed_weight=_StubWeight(),
-            stream=fake_other,
+            stream=99,
         )

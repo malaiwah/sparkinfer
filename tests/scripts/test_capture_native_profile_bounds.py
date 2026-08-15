@@ -804,11 +804,28 @@ def test_shell_rejects_invalid_env():
         assert result.returncode != 0
         assert "positive integer" in result.stderr or "Error" in result.stderr
 
+@pytest.fixture
+def curl_8_4():
+    try:
+        first_line = subprocess.run(
+            ["curl", "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.splitlines()[0]
+        major, minor = (int(part) for part in first_line.split()[1].split(".")[:2])
+    except (FileNotFoundError, subprocess.SubprocessError, IndexError, ValueError):
+        pytest.skip("curl version could not be determined")
+    if (major, minor) < (8, 4):
+        pytest.skip(f"shell transport requires curl >= 8.4, found {major}.{minor}")
+
+
 # ---------------------------------------------------------------------------
 # Shell wrapper: normal byte-identical output
 # ---------------------------------------------------------------------------
 
-def test_shell_normal_output(fake_server):
+def test_shell_normal_output(fake_server, curl_8_4):
     """Shell wrapper produces byte-identical output for a normal response."""
     srv = fake_server(mode="normal_stream")
     sh = _SCRIPTS / "capture_sglang_native_profile.sh"
@@ -829,7 +846,7 @@ def test_shell_normal_output(fake_server):
 # Shell wrapper: oversized body rejected
 # ---------------------------------------------------------------------------
 
-def test_shell_oversized_body_rejected(fake_server):
+def test_shell_oversized_body_rejected(fake_server, curl_8_4):
     srv = fake_server(mode="oversized_body_chunked", payload_size=4 * 1024 * 1024)
     sh = _SCRIPTS / "capture_sglang_native_profile.sh"
     result = subprocess.run(
