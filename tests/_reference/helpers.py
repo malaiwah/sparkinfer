@@ -382,8 +382,11 @@ def llama_rms_norm(
 def require_b12x() -> torch.device:
     """Skip unless a real SM120/SM121 device is present (migrated-test gate)."""
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for b12x tests")
+        pytest.skip("CUDA is required for b12x tests", allow_module_level=True)
     major, minor = torch.cuda.get_device_capability()
     if major != 12 or minor not in (0, 1):
-        pytest.skip(f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}")
+        pytest.skip(
+            f"SM12x (SM120/SM121) GPU required, found sm_{major}{minor}",
+            allow_module_level=True,
+        )
     return torch.device("cuda")
