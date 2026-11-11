@@ -1,0 +1,1 @@
+Recovery snapshot of an unresolved merge from ~/Projects/sparkinfer-w4a16-final-residue-tests. The working files contain conflict markers; base, ours and theirs are Git index stages 1, 2 and 3. These are historical artifacts, not active source. Original HEAD: cae3aad137bd739881833c064e1912177698156f.
